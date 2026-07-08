@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import logging
 import telebot
 from telebot import types
 from dotenv import load_dotenv
@@ -15,6 +16,9 @@ if not TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
 bot = telebot.TeleBot(TOKEN)
+
+logger = telebot.logger
+telebot.logger.setLevel(logging.DEBUG)
 
 # --- Полки пользователей (отложенные книги) ---
 SHELVES_FILE = "shelves.json"
