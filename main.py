@@ -15,7 +15,7 @@ TOKEN = os.environ.get('BOT_TOKEN')
 if not TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, threaded=False)
 
 logger = telebot.logger
 telebot.logger.setLevel(logging.DEBUG)
