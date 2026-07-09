@@ -2,6 +2,7 @@ import os
 import json
 import random
 import logging
+import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
@@ -19,6 +20,120 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 
 logger = telebot.logger
 telebot.logger.setLevel(logging.DEBUG)
+
+# --- Интеграция с открытым поисковым API ЛитРес ---
+# Публичный эндпоинт поиска. Для книг обязателен параметр types
+# (допустимые значения: text_book, audiobook, paper_book, ...).
+LITRES_SEARCH_API = "https://api.litres.ru/foundation/api/search"
+LITRES_BASE = "https://www.litres.ru"      # канонические страницы книг
+LITRES_CDN = "https://cdn.litres.ru"        # хост обложек (без редиректа ddos-guard)
+
+# Лимит длины подписи (caption) в Telegram — 1024 символа.
+CAPTION_LIMIT = 1024
+
+
+def fetch_litres_data(title: str, author: str) -> dict | None:
+    """Ищет книгу на ЛитРес по названию и автору через публичный API поиска.
+
+    Возвращает словарь с ключами:
+        - cover_url: прямая ссылка на обложку (CDN),
+        - rating:    средний рейтинг пользователей (float) или None,
+        - book_url:  прямая ссылка на страницу книги на ЛитРес.
+    При любой ошибке (нет сети, API недоступно, книга не найдена,
+    некорректный ответ) — возвращает None, чтобы бот мог откатиться
+    на текстовый режим (fallback).
+    """
+    if not title:
+        return None
+
+    query = f"{title} {author}".strip() if author else title
+    params = {
+        "q": query,
+        "types": "text_book",
+    }
+
+    try:
+        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        # Сеть недоступна / API вернул не-JSON / некорректный статус.
+        return None
+
+    payload = data.get("payload") or {}
+    items = payload.get("data") or []
+    if not items:
+        return None
+
+    # Берём первый релевантный результат выдачи.
+    instance = items[0].get("instance") or {}
+
+    cover = instance.get("cover_url")
+    if not cover:
+        return None
+    if cover.startswith("/"):
+        cover = LITRES_CDN + cover
+
+    url = instance.get("url")
+    if url and url.startswith("/"):
+        url = LITRES_BASE + url
+
+    rating_obj = instance.get("rating") or {}
+    rating = rating_obj.get("rated_avg")
+
+    return {
+        "cover_url": cover,
+        "rating": rating,
+        "book_url": url,
+    }
+
+
+def _build_caption(
+    title: str,
+    author: str,
+    description: str,
+    aftertaste: str,
+    litres_rating,
+    litres_url: str,
+) -> str:
+    """Собирает HTML-подпись к фото и обрезает её до лимита Telegram (1024).
+
+    Варьируемая часть — аннотация, поэтому при превышении лимита
+    обрезается в первую очередь она (с многоточием).
+    """
+    if litres_rating is not None:
+        full = max(1, min(5, int(round(litres_rating))))
+        stars = "⭐" * full
+        rating_line = f"⭐ <b>Рейтинг ЛитРес:</b> {stars} {litres_rating}\n"
+    else:
+        rating_line = "⭐ <b>Рейтинг ЛитРес:</b> пока нет оценок\n"
+
+    link_line = f"🔗 <a href=\"{litres_url}\">Открыть на ЛитРес</a>\n" if litres_url else ""
+
+    header = (
+        f"📖 <b>{title}</b>\n"
+        f"✍️ <i>{author}</i>\n\n"
+        f"📝 <b>Аннотация:</b>\n"
+    )
+    footer = (
+        f"\n{link_line}\n"
+        f"🥂 <b>Послевкусие</b>\n\n{aftertaste}\n\n"
+        f"{rating_line}"
+    )
+
+    body = description or ""
+    caption = header + body + footer
+    if len(caption) > CAPTION_LIMIT:
+        # Обрезаем аннотацию, оставляя запас под многоточие.
+        allowed = CAPTION_LIMIT - len(header) - len(footer) - 1
+        if allowed > 0:
+            body = body[:allowed].rstrip() + "…"
+            caption = header + body + footer
+        else:
+            # Заголовок + подвал сами по себе не влезают — режем всё.
+            caption = (header + footer)[: CAPTION_LIMIT - 1] + "…"
+    return caption
+
 
 # --- Полки пользователей (отложенные книги) ---
 SHELVES_FILE = "shelves.json"
@@ -198,6 +313,21 @@ def handle_main_menu(message):
     )
 
 
+def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "types.Message":
+    """Fallback-режим: отправляет книгу обычным текстовым сообщением
+    (старое поведение бота, до интеграции с ЛитРес)."""
+    link = book.get("Ссылка")
+    link_line = f"🔗 <a href=\"{link}\">Открыть в Google Books</a>\n\n" if link else ""
+    response = (
+        f"📖 <b>{book['Название']}</b>\n"
+        f"✍️ <i>{book['Автор']}</i>\n\n"
+        f"📝 <b>Аннотация:</b>\n{book['Описание']}\n\n"
+        f"{link_line}"
+        f"🥂 <b>Послевкусие</b>\n\n{intro_text}"
+    )
+    return bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
 def on_mood_selected(call):
     """Обработка выбора настроения из inline-клавиатуры."""
@@ -224,25 +354,42 @@ def on_mood_selected(call):
         intro = random.choice(SOMMELIER_INTROS)
         # Убираем ведущий «🍷 » у подводки сомелье, т.к. выше уже стоит «🥂 Послевкусие»
         intro_text = intro.replace("🍷 ", "", 1)
-    # Ссылка на книгу в Google Books (если API её вернул)
-    link = book.get("Ссылка")
-    link_line = f"🔗 <a href=\"{link}\">Открыть в Google Books</a>\n\n" if link else ""
-    response = (
-        f"📖 <b>{book['Название']}</b>\n"
-        f"✍️ <i>{book['Автор']}</i>\n\n"
-        f"📝 <b>Аннотация:</b>\n{book['Описание']}\n\n"
-        f"{link_line}"
-        f"🥂 <b>Послевкусие</b>\n\n{intro_text}"
-    )
+
     # Inline-кнопки под каждой рекомендацией: отложить на полку и убрать с полки
     shelf_kb = types.InlineKeyboardMarkup()
     shelf_kb.row(
         types.InlineKeyboardButton("📌 Отложить на полку", callback_data="shelf_add"),
         types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
     )
-    sent = bot.send_message(
-        call.message.chat.id, response, parse_mode="HTML", reply_markup=shelf_kb
-    )
+
+    # Дополняем выдачу динамическими данными с ЛитРес (обложка, рейтинг, ссылка).
+    litres = fetch_litres_data(book["Название"], book["Автор"])
+
+    if litres and litres.get("cover_url"):
+        caption = _build_caption(
+            title=book["Название"],
+            author=book["Автор"],
+            description=book["Описание"],
+            aftertaste=intro_text,
+            litres_rating=litres.get("rating"),
+            litres_url=litres.get("book_url"),
+        )
+        try:
+            sent = bot.send_photo(
+                call.message.chat.id,
+                photo=litres["cover_url"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=shelf_kb,
+            )
+        except telebot.apihelper.ApiException:
+            # Не удалось отправить фото (обложка недоступна для Telegram и т.п.) —
+            # откатываемся на текстовое сообщение.
+            sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
+    else:
+        # Данные ЛитРес не получены (None) — обычный текстовый режим (fallback).
+        sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
+
     # Запоминаем, какую книгу показали в этом сообщении, чтобы кнопка
     # добавляла именно её.
     pending_book[sent.message_id] = book
