@@ -32,24 +32,45 @@ LITRES_CDN = "https://cdn.litres.ru"        # хост обложек (без р
 CAPTION_LIMIT = 1024
 
 
-def fetch_litres_data(title: str, author: str) -> dict | None:
-    """Ищет книгу на ЛитРес по названию и автору через публичный API поиска.
+# --- Маппинг эмоциональных категорий на поисковые запросы ЛитРес ---
+# Ключ — наша категория из меню, значение — ключевые слова для поиска
+# по каталогу ЛитРес (жанры/тематики на русском).
+MOOD_TO_LITRES = {
+    "Уютный вечер": "современная проза бестселлеры",
+    "Хочу острых ощущений": "остросюжетный триллер боевик",
+    "Немного поплакать": "лирическая проза драма",
+    "Пища для ума": "научно-популярная литература",
+    "Лёгкость и смех": "юмористическая проза",
+    "Уйти от реальности": "фэнтези фантастика",
+    "Закрытый клуб": "интеллектуальный детектив классика",
+    "Проглотить за одну ночь": "зарубежный детектив бестселлеры",
+    "Моральный детокс": "современная проза бестселлеры",
+}
 
-    Возвращает словарь с ключами:
-        - cover_url: прямая ссылка на обложку (CDN),
-        - rating:    средний рейтинг пользователей (float) или None,
-        - book_url:  прямая ссылка на страницу книги на ЛитРес.
-    При любой ошибке (нет сети, API недоступно, книга не найдена,
-    некорректный ответ) — возвращает None, чтобы бот мог откатиться
-    на текстовый режим (fallback).
+# Сколько топовых результатов рассматриваем при случайном выборе.
+LITRES_TOP_N = 20
+
+
+def get_litres_random_book(category: str) -> dict | None:
+    """Ищет случайную книгу по категории напрямую через API ЛитРес.
+
+    Берёт ключевые слова для категории из MOOD_TO_LITRES, делает запрос к
+    поисковому API и выбирает случайную книгу из топа результатов.
+
+    Возвращает словарь, нормализованный под нашу схему книги:
+        - Название, Автор, Ссылка — для полки и отображения,
+        - Описание               — аннотация/подзаголовок с ЛитРес,
+        - cover_url, rating, book_url — данные для карточки.
+    При ошибке запроса или отсутствии книг — возвращает None (fallback).
     """
-    if not title:
+    query = MOOD_TO_LITRES.get(category)
+    if not query:
         return None
 
-    query = f"{title} {author}".strip() if author else title
     params = {
         "q": query,
         "types": "text_book",
+        "limit": LITRES_TOP_N,
     }
 
     try:
@@ -65,8 +86,9 @@ def fetch_litres_data(title: str, author: str) -> dict | None:
     if not items:
         return None
 
-    # Берём первый релевантный результат выдачи.
-    instance = items[0].get("instance") or {}
+    # Случайная книга из топа (до LITRES_TOP_N результатов выдачи).
+    pick = random.choice(items[:LITRES_TOP_N])
+    instance = pick.get("instance") or {}
 
     cover = instance.get("cover_url")
     if not cover:
@@ -78,37 +100,58 @@ def fetch_litres_data(title: str, author: str) -> dict | None:
     if url and url.startswith("/"):
         url = LITRES_BASE + url
 
+    persons = instance.get("persons") or []
+    authors = [
+        p.get("full_name")
+        for p in persons
+        if p.get("role") == "author" and p.get("full_name")
+    ]
+    author = ", ".join(authors) if authors else "Неизвестный автор"
+
     rating_obj = instance.get("rating") or {}
     rating = rating_obj.get("rated_avg")
 
+    # Полноценной аннотации в поисковом API нет — берём подзаголовок
+    # (часто это описание серии/издания). Пустые значения позже заменяются
+    # на короткую заметку при формировании карточки.
+    annotation = (instance.get("subtitle") or "").strip()
+
     return {
+        "Название": instance.get("title", "—"),
+        "Автор": author,
+        "Ссылка": url,
+        "Описание": annotation,
+        "Послевкусие": "",
         "cover_url": cover,
         "rating": rating,
         "book_url": url,
     }
 
 
-def _build_caption(
-    title: str,
-    author: str,
-    description: str,
-    aftertaste: str,
-    litres_rating,
-    litres_url: str,
-) -> str:
-    """Собирает HTML-подпись к фото и обрезает её до лимита Telegram (1024).
+def _build_litres_caption(book: dict) -> str:
+    """Собирает HTML-подпись к карточке ЛитРес и обрезает до лимита (1024)."""
+    title = book.get("Название", "—")
+    author = book.get("Автор", "—")
+    annotation = (book.get("Описание") or "").strip()
+    if not annotation:
+        annotation = (
+            "Краткое описание недоступно на ЛитРес — загляни на страницу "
+            "книги по ссылке ниже."
+        )
+    rating = book.get("rating")
+    book_url = book.get("book_url") or book.get("Ссылка") or ""
 
-    Варьируемая часть — аннотация, поэтому при превышении лимита
-    обрезается в первую очередь она (с многоточием).
-    """
-    if litres_rating is not None:
-        full = max(1, min(5, int(round(litres_rating))))
+    if rating is not None and rating > 0:
+        full = max(1, min(5, int(round(rating))))
         stars = "⭐" * full
-        rating_line = f"⭐ <b>Рейтинг ЛитРес:</b> {stars} {litres_rating}\n"
+        rating_line = f"⭐ <b>Рейтинг ЛитРес:</b> {stars} {rating}\n"
     else:
         rating_line = "⭐ <b>Рейтинг ЛитРес:</b> пока нет оценок\n"
 
-    link_line = f"🔗 <a href=\"{litres_url}\">Открыть на ЛитРес</a>\n" if litres_url else ""
+    link_line = f"🔗 <a href=\"{book_url}\">Открыть на ЛитРес</a>\n" if book_url else ""
+
+    # Короткая подводка сомелье — сохраняем «голос» бота.
+    intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
 
     header = (
         f"📖 <b>{title}</b>\n"
@@ -116,23 +159,39 @@ def _build_caption(
         f"📝 <b>Аннотация:</b>\n"
     )
     footer = (
-        f"\n{link_line}\n"
-        f"🥂 <b>Послевкусие</b>\n\n{aftertaste}\n\n"
+        f"\n🥂 <b>Послевкусие</b>\n\n{intro}\n\n"
         f"{rating_line}"
+        f"{link_line}"
     )
 
-    body = description or ""
-    caption = header + body + footer
+    caption = header + annotation + footer
     if len(caption) > CAPTION_LIMIT:
         # Обрезаем аннотацию, оставляя запас под многоточие.
         allowed = CAPTION_LIMIT - len(header) - len(footer) - 1
         if allowed > 0:
-            body = body[:allowed].rstrip() + "…"
-            caption = header + body + footer
+            annotation = annotation[:allowed].rstrip() + "…"
+            caption = header + annotation + footer
         else:
             # Заголовок + подвал сами по себе не влезают — режем всё.
             caption = (header + footer)[: CAPTION_LIMIT - 1] + "…"
     return caption
+
+
+def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
+    """Отправляет карточку книги (обложка + подпись) из данных ЛитРес.
+    При неудаче с фото откатывается на текстовое сообщение."""
+    caption = _build_litres_caption(book)
+    try:
+        return bot.send_photo(
+            chat_id,
+            photo=book["cover_url"],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=shelf_kb,
+        )
+    except telebot.apihelper.ApiException:
+        intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
+        return _send_book_text(chat_id, book, intro, shelf_kb)
 
 
 # --- Полки пользователей (отложенные книги) ---
@@ -330,11 +389,31 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
 def on_mood_selected(call):
-    """Обработка выбора настроения из inline-клавиатуры."""
+    """Обработка выбора настроения из inline-клавиатуры.
+
+    Сначала пытаемся найти книгу по категории напрямую через ЛитРес.
+    Если API недоступно или ничего не найдено — берём книгу из нашей
+    подборки books.json (fallback).
+    """
     category = call.data[len("mood_"):]
+
+    # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
+    litres_book = get_litres_random_book(category)
+    if litres_book:
+        shelf_kb = types.InlineKeyboardMarkup()
+        shelf_kb.row(
+            types.InlineKeyboardButton("📌 Отложить на полку", callback_data="shelf_add"),
+            types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
+        )
+        sent = _send_litres_card(call.message.chat.id, litres_book, shelf_kb)
+        pending_book[sent.message_id] = litres_book
+        bot.answer_callback_query(call.id)
+        return
+
+    # 2) Fallback: книга из нашей подборки books.json (или Google Books).
     book = get_book_for_mood(category)
 
-    # Книга не найдена или ошибка API — предлагаем выбрать другое настроение
+    # Книга не найдена или ошибка API — предлагаем выбрать другое настроение.
     if book.get("Название") == "—":
         bot.answer_callback_query(call.id)
         bot.send_message(
@@ -362,36 +441,8 @@ def on_mood_selected(call):
         types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
     )
 
-    # Дополняем выдачу динамическими данными с ЛитРес (обложка, рейтинг, ссылка).
-    litres = fetch_litres_data(book["Название"], book["Автор"])
-
-    if litres and litres.get("cover_url"):
-        caption = _build_caption(
-            title=book["Название"],
-            author=book["Автор"],
-            description=book["Описание"],
-            aftertaste=intro_text,
-            litres_rating=litres.get("rating"),
-            litres_url=litres.get("book_url"),
-        )
-        try:
-            sent = bot.send_photo(
-                call.message.chat.id,
-                photo=litres["cover_url"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=shelf_kb,
-            )
-        except telebot.apihelper.ApiException:
-            # Не удалось отправить фото (обложка недоступна для Telegram и т.п.) —
-            # откатываемся на текстовое сообщение.
-            sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
-    else:
-        # Данные ЛитРес не получены (None) — обычный текстовый режим (fallback).
-        sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
-
-    # Запоминаем, какую книгу показали в этом сообщении, чтобы кнопка
-    # добавляла именно её.
+    # Fallback-режим: обычное текстовое сообщение (старое поведение бота).
+    sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
     pending_book[sent.message_id] = book
     bot.answer_callback_query(call.id)
 
