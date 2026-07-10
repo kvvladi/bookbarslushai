@@ -85,20 +85,18 @@ def get_litres_random_book(category: str) -> dict | None:
         return None
 
     # Случайная книга из топа (до LITRES_TOP_N результатов выдачи).
-    pick = random.choice(items[:LITRES_TOP_N])
-    instance = pick.get("instance") or {}
+    # Сначала оставляем только те, у которых есть обложка, чтобы не возвращать
+    # None из-за отсутствия картинки у случайно выбранного элемента.
+    candidates = []
+    for item in items[:LITRES_TOP_N]:
+        inst = item.get("instance") or {}
+        if inst.get("cover_url"):
+            candidates.append(inst)
+    if not candidates:
+        return None
+    instance = random.choice(candidates)
 
     cover = instance.get("cover_url")
-    if not cover:
-        return None
-    if cover.startswith("/"):
-        cover = LITRES_CDN + cover
-
-    url = instance.get("url")
-    if url and url.startswith("/"):
-        url = LITRES_BASE + url
-
-    persons = instance.get("persons") or []
     authors = [
         p.get("full_name")
         for p in persons
@@ -130,26 +128,21 @@ def _build_litres_caption(book: dict) -> str:
     """Собирает HTML-подпись к карточке ЛитРес и обрезает до лимита (1024)."""
     title = book.get("Название", "—")
     author = book.get("Автор", "—")
-    annotation = (book.get("Описание") or "").strip()
-    if not annotation:
-        annotation = (
-            "Краткое описание недоступно на ЛитРес — загляни на страницу "
-            "книги по ссылке ниже."
-        )
     rating = book.get("rating")
     book_url = book.get("book_url") or book.get("Ссылка") or ""
 
+    annotation = (book.get("Описание") or "").strip()
     if rating is not None and rating > 0:
         full = max(1, min(5, int(round(rating))))
         stars = "⭐" * full
-        rating_line = f"⭐ <b>Рейтинг ЛитРес:</b> {stars} {rating}\n"
+        rating_line = f"🏆 <b>Рейтинг ЛитРес:</b> {stars} {rating}\n"
     else:
-        rating_line = "⭐ <b>Рейтинг ЛитРес:</b> пока нет оценок\n"
+        rating_line = "🏆 <b>Рейтинг ЛитРес:</b> пока нет оценок\n"
 
     link_line = f"🔗 <a href=\"{book_url}\">Читать на ЛитРес</a>\n" if book_url else ""
 
     # Подводка сомелье: используем кураторское «послевкусие» (если есть,
-    # например, из books.json), иначе — случайную подводку.
+    # например, из books.json), иначе — случайную подводка.
     intro = (book.get("Послевкусие") or "").strip()
     if not intro:
         intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
@@ -157,26 +150,28 @@ def _build_litres_caption(book: dict) -> str:
     header = (
         f"📖 <b>{title}</b>\n"
         f"✍️ <i>{author}</i>\n\n"
-        f"📝 <b>Аннотация:</b>\n"
     )
+    # Аннотацию показываем только если она не пустая.
+    if annotation:
+        header += f"📝 <b>Аннотация:</b>\n{annotation}\n\n"
+
     footer = (
-        f"\n🥂 <b>Послевкусие</b>\n\n{intro}\n\n"
+        f"🥂 <b>Послевкусие</b>\n\n{intro}\n\n"
         f"{rating_line}"
         f"{link_line}"
     )
 
-    caption = header + annotation + footer
+    caption = header + footer
     if len(caption) > CAPTION_LIMIT:
-        # Обрезаем аннотацию, оставляя запас под многоточие.
+        # Обрезаем подводку/футер, оставляя запас под многоточие.
         allowed = CAPTION_LIMIT - len(header) - len(footer) - 1
         if allowed > 0:
-            annotation = annotation[:allowed].rstrip() + "…"
-            caption = header + annotation + footer
+            footer = footer[:allowed].rstrip() + "…"
+            caption = header + footer
         else:
             # Заголовок + подвал сами по себе не влезают — режем всё.
             caption = (header + footer)[: CAPTION_LIMIT - 1] + "…"
     return caption
-
 
 def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
     """Отправляет карточку книги (обложка + подпись) из данных ЛитРес.
@@ -430,18 +425,24 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
     if not items:
         return None
 
-    instance = items[0].get("instance") or {}
-    cover = instance.get("cover_url")
+    # Ищем первый элемент с обложкой среди первых 5 результатов.
+    cover = None
+    url = None
+    rating = None
+    for item in items[:5]:
+        inst = item.get("instance") or {}
+        if inst.get("cover_url"):
+            cover = inst["cover_url"]
+            url = inst.get("url")
+            rating = (inst.get("rating") or {}).get("rated_avg")
+            break
     if not cover:
         return None
     if cover.startswith("/"):
         cover = LITRES_CDN + cover
-
-    url = instance.get("url")
     if url and url.startswith("/"):
         url = LITRES_BASE + url
 
-    rating = (instance.get("rating") or {}).get("rated_avg")
     return {"cover_url": cover, "book_url": url, "rating": rating}
 
 
@@ -450,12 +451,14 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
     (старое поведение бота, до интеграции с ЛитРес)."""
     link = book.get("Ссылка")
     link_line = f"🔗 <a href=\"{link}\">Читать на ЛитРес</a>\n\n" if link else ""
+    annotation = (book.get("Описание") or "").strip()
+    ann_line = f"📝 <b>Аннотация:</b>\n{annotation}\n\n" if annotation else ""
     response = (
         f"📖 <b>{book['Название']}</b>\n"
         f"✍️ <i>{book['Автор']}</i>\n\n"
-        f"📝 <b>Аннотация:</b>\n{book['Описание']}\n\n"
+        f"{ann_line}"
+        f"🥂 <b>Послевкусие</b>\n\n{intro_text}\n\n"
         f"{link_line}"
-        f"🥂 <b>Послевкусие</b>\n\n{intro_text}"
     )
     return bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
 
