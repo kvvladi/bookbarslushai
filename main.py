@@ -121,6 +121,22 @@ def get_litres_random_book(category: str) -> dict | None:
     if not items:
         return None
 
+    # Жёсткий фильтр: оставляем только книги с реальным рейтингом
+    # (рейтинг строго больше 0 и не равен None), чтобы не выдавать
+    # неоценённые самоиздаты. Фильтруем ДО отбора топа по популярности,
+    # чтобы пул кандидатов состоял исключительно из оценённых книг.
+    def _has_valid_rating(item: dict) -> bool:
+        inst = item.get("instance") or {}
+        rating_obj = inst.get("rating") or {}
+        rating = rating_obj.get("rated_avg")
+        return rating is not None and rating > 0
+
+    items = [item for item in items if _has_valid_rating(item)]
+    if not items:
+        # Ни одной книги с рейтингом не найдено — возвращаем None,
+        # чтобы сработал стандартный fallback (выдача из books.json).
+        return None
+
     # Берём только топ-LITRES_TOP_N самых популярных книг из ответа API
     # (выдача уже отсортирована по популярности через sort=popular) и из
     # этого «элитного» списка выбираем одну случайную книгу.
