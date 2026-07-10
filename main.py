@@ -616,8 +616,14 @@ def webhook():
 
     json_string = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
-    return '!', 200
+    try:
+        bot.process_new_updates([update])
+    except Exception as e:
+        # Логируем внутреннюю ошибку (например, сбой API ЛитРес), но всегда
+        # возвращаем Telegram статус 200, чтобы он не повторял запросы и не
+        # спамил нас 429 Too Many Requests.
+        logger.error("Ошибка при обработке обновления в webhook: %s", e)
+    return 'OK', 200
 
 
 @app.route('/')
