@@ -8,8 +8,6 @@ from telebot import types
 from dotenv import load_dotenv
 from flask import Flask, request
 
-from book_api import get_book_for_mood
-
 load_dotenv()
 
 TOKEN = os.environ.get('BOT_TOKEN')
@@ -148,10 +146,13 @@ def _build_litres_caption(book: dict) -> str:
     else:
         rating_line = "⭐ <b>Рейтинг ЛитРес:</b> пока нет оценок\n"
 
-    link_line = f"🔗 <a href=\"{book_url}\">Открыть на ЛитРес</a>\n" if book_url else ""
+    link_line = f"🔗 <a href=\"{book_url}\">Читать на ЛитРес</a>\n" if book_url else ""
 
-    # Короткая подводка сомелье — сохраняем «голос» бота.
-    intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
+    # Подводка сомелье: используем кураторское «послевкусие» (если есть,
+    # например, из books.json), иначе — случайную подводку.
+    intro = (book.get("Послевкусие") or "").strip()
+    if not intro:
+        intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
 
     header = (
         f"📖 <b>{title}</b>\n"
@@ -372,11 +373,83 @@ def handle_main_menu(message):
     )
 
 
+# --- Кураторская подборка books.json (локальный fallback) ---
+BOOKS_FILE = "books.json"
+_curated_cache: dict | None = None
+
+
+def _load_curated() -> dict:
+    """Загружает кураторскую подборку из books.json (с кэшированием)."""
+    global _curated_cache
+    if _curated_cache is None:
+        try:
+            with open(BOOKS_FILE, "r", encoding="utf-8") as f:
+                _curated_cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _curated_cache = {}
+    return _curated_cache
+
+
+def get_book_from_json(category: str) -> dict | None:
+    """Случайная книга из books.json по категории (fallback-источник).
+
+    Возвращает словарь в нашей схеме (Название, Автор, Описание, Послевкусие)
+    или None, если для категории нет книг в подборке.
+    """
+    books = _load_curated().get(category)
+    if not books:
+        return None
+    b = random.choice(books)
+    return {
+        "Название": b.get("title", "—"),
+        "Автор": b.get("author", "—"),
+        "Описание": b.get("annotation", ""),
+        "Послевкусие": b.get("aftertaste", ""),
+        "Ссылка": "",
+    }
+
+
+def search_litres_by_title(title: str, author: str) -> dict | None:
+    """Ищет конкретную книгу на ЛитРес по названию+автору, чтобы обогатить
+    книгу из books.json обложкой и прямой ссылкой.
+
+    Возвращает {cover_url, book_url, rating} или None при ошибке/отсутствии.
+    """
+    if not title:
+        return None
+    query = f"{title} {author}".strip() if author else title
+    params = {"q": query, "types": "text_book", "limit": 5}
+    try:
+        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    items = (data.get("payload") or {}).get("data") or []
+    if not items:
+        return None
+
+    instance = items[0].get("instance") or {}
+    cover = instance.get("cover_url")
+    if not cover:
+        return None
+    if cover.startswith("/"):
+        cover = LITRES_CDN + cover
+
+    url = instance.get("url")
+    if url and url.startswith("/"):
+        url = LITRES_BASE + url
+
+    rating = (instance.get("rating") or {}).get("rated_avg")
+    return {"cover_url": cover, "book_url": url, "rating": rating}
+
+
 def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "types.Message":
     """Fallback-режим: отправляет книгу обычным текстовым сообщением
     (старое поведение бота, до интеграции с ЛитРес)."""
     link = book.get("Ссылка")
-    link_line = f"🔗 <a href=\"{link}\">Открыть в Google Books</a>\n\n" if link else ""
+    link_line = f"🔗 <a href=\"{link}\">Читать на ЛитРес</a>\n\n" if link else ""
     response = (
         f"📖 <b>{book['Название']}</b>\n"
         f"✍️ <i>{book['Автор']}</i>\n\n"
@@ -410,29 +483,17 @@ def on_mood_selected(call):
         bot.answer_callback_query(call.id)
         return
 
-    # 2) Fallback: книга из нашей подборки books.json (или Google Books).
-    book = get_book_for_mood(category)
-
-    # Книга не найдена или ошибка API — предлагаем выбрать другое настроение.
-    if book.get("Название") == "—":
+    # 2) Fallback: случайная книга из нашей подборки books.json.
+    book = get_book_from_json(category)
+    if not book:
         bot.answer_callback_query(call.id)
         bot.send_message(
             call.message.chat.id,
-            f"😔 {book['Описание']}\n\n"
-            f"Загляни в другой погреб — выбери настроение на кнопках ниже 👇",
+            "😔 В этой подборке пока пусто. Загляни в другой погреб — "
+            "выбери настроение на кнопках ниже 👇",
             reply_markup=get_mood_inline_keyboard(),
         )
         return
-
-    # Если у книги есть готовое «послевкусие» из кураторской подборки —
-    # используем его, иначе берём случайную подводку сомелье.
-    aftertaste = book.get("Послевкусие")
-    if aftertaste:
-        intro_text = aftertaste
-    else:
-        intro = random.choice(SOMMELIER_INTROS)
-        # Убираем ведущий «🍷 » у подводки сомелье, т.к. выше уже стоит «🥂 Послевкусие»
-        intro_text = intro.replace("🍷 ", "", 1)
 
     # Inline-кнопки под каждой рекомендацией: отложить на полку и убрать с полки
     shelf_kb = types.InlineKeyboardMarkup()
@@ -441,8 +502,21 @@ def on_mood_selected(call):
         types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
     )
 
-    # Fallback-режим: обычное текстовое сообщение (старое поведение бота).
-    sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
+    # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
+    # чтобы показать её в том же «карточном» формате, что и основную выдачу.
+    enrich = search_litres_by_title(book["Название"], book["Автор"])
+    if enrich and enrich.get("cover_url"):
+        book["cover_url"] = enrich["cover_url"]
+        book["book_url"] = enrich.get("book_url") or ""
+        book["rating"] = enrich.get("rating")
+        book["Ссылка"] = book["book_url"]
+        sent = _send_litres_card(call.message.chat.id, book, shelf_kb)
+    else:
+        # ЛитРес недоступен для обогащения — отправляем текстом (наша
+        # кураторская аннотация и «послевкусие» сохраняются).
+        intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
+        sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
+
     pending_book[sent.message_id] = book
     bot.answer_callback_query(call.id)
 
