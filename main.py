@@ -266,6 +266,11 @@ def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
 # «На полку» / «Уже читал» добавляла именно её, а не последнюю показанную.
 pending_book: dict[int, dict] = {}
 
+# Текущая выбранная категория (настроение) каждого пользователя.
+# Хранится в памяти процесса: при перезапуске бота сбрасывается, что
+# приемлемо — пользователь просто заново выбирает настроение в меню.
+user_current_category: dict[int, str] = {}
+
 
 def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
     """Добавляет книгу на полку пользователя с указанным статусом.
@@ -475,12 +480,19 @@ def _book_hash(book: dict) -> str:
 
 
 def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
-    """Клавиатура с кнопками «На полку» и «Уже читал» под рекомендацией."""
+    """Клавиатура с кнопками «На полку», «Уже читал» и «Следующая книга».
+
+    Первые две кнопки идут в один ряд, а «Следующая книга» — широкой
+    кнопкой во втором ряду, чтобы интерфейс оставался аккуратным.
+    """
     kb = types.InlineKeyboardMarkup(row_width=2)
     book_hash = _book_hash(book)
     kb.row(
         types.InlineKeyboardButton("📥 На полку", callback_data=f"shelf_add_saved_{book_hash}"),
         types.InlineKeyboardButton("✅ Уже читал", callback_data=f"shelf_add_read_{book_hash}"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("🔄 Следующая книга", callback_data="next_book"),
     )
     return kb
 
@@ -625,31 +637,28 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
     return bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
-def on_mood_selected(call):
-    """Обработка выбора настроения из inline-клавиатуры.
+def send_recommendation(chat_id: int, category: str) -> None:
+    """Полный цикл поиска и отправки карточки книги по категории.
 
-    Сначала пытаемся найти книгу по категории напрямую через ЛитРес.
-    Если API недоступно или ничего не найдено — берём книгу из нашей
-    подборки books.json (fallback).
+    Сначала пытаемся найти книгу по категории напрямую через ЛитРес
+    (с учётом фильтров рейтинга и популярности). Если API недоступно
+    или ничего не найдено — берём книгу из нашей подборки books.json
+    (fallback). Используется и при первичном выборе настроения, и при
+    нажатии кнопки «Следующая книга».
     """
-    category = call.data[len("mood_"):]
-
     # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
     litres_book = get_litres_random_book(category)
     if litres_book:
         shelf_kb = get_shelf_action_kb(litres_book)
-        sent = _send_litres_card(call.message.chat.id, litres_book, shelf_kb)
+        sent = _send_litres_card(chat_id, litres_book, shelf_kb)
         pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
-        bot.answer_callback_query(call.id)
         return
 
     # 2) Fallback: случайная книга из нашей подборки books.json.
     book = get_book_from_json(category)
     if not book:
-        bot.answer_callback_query(call.id)
         bot.send_message(
-            call.message.chat.id,
+            chat_id,
             "😔 В этой подборке пока пусто. Загляни в другой погреб — "
             "выбери настроение на кнопках ниже 👇",
             reply_markup=get_mood_inline_keyboard(),
@@ -666,14 +675,54 @@ def on_mood_selected(call):
         book["book_url"] = enrich.get("book_url") or ""
         book["rating"] = enrich.get("rating")
         book["Ссылка"] = book["book_url"]
-        sent = _send_litres_card(call.message.chat.id, book, shelf_kb)
+        sent = _send_litres_card(chat_id, book, shelf_kb)
     else:
         # ЛитРес недоступен для обогащения — отправляем текстом (наша
         # кураторская аннотация и «послевкусие» сохраняются).
         intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
-        sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
+        sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
 
     pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
+def on_mood_selected(call):
+    """Обработка выбора настроения из inline-клавиатуры.
+
+    Запоминаем выбранную категорию пользователя (state management) и
+    запускаем полный цикл поиска/отправки рекомендации.
+    """
+    category = call.data[len("mood_"):]
+    # Сохраняем текущее настроение, чтобы кнопка «Следующая книга»
+    # могла заново запустить поиск в той же категории.
+    user_current_category[call.message.chat.id] = category
+    send_recommendation(call.message.chat.id, category)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "next_book")
+def on_next_book(call):
+    """Обработка кнопки «Следующая книга» под рекомендацией.
+
+    Извлекает сохранённую категорию пользователя и заново запускает
+    весь цикл поиска (ЛитРес с фильтрами → fallback из books.json),
+    отправляя новую карточку книги отдельным сообщением (самый
+    стабильный UX для telebot: не зависит от типа медиа предыдущей
+    карточки — фото или текст).
+    """
+    chat_id = call.message.chat.id
+    category = user_current_category.get(chat_id)
+    if not category:
+        # Пользователь ещё не выбирал настроение в этой сессии.
+        bot.answer_callback_query(call.id, "Сначала выбери настроение 🎭")
+        bot.send_message(
+            chat_id,
+            "Чтобы получать рекомендации, сначала выбери настроение 👇",
+            reply_markup=get_mood_inline_keyboard(),
+        )
+        return
+
+    send_recommendation(chat_id, category)
     bot.answer_callback_query(call.id)
 
 
