@@ -84,7 +84,7 @@ MOOD_TO_LITRES = {
     "Моральный детокс": "современная проза вдохновляющие бестселлеры",
     # Новые категории меню: детективы/триллеры, любовные романы, фэнтези.
     "Холодный расчёт": "остросюжетный детектив триллер звездная коллекция издательских детективов и мистики",
-    "Пьянящая романтика": "любовный роман бестселлеры колин гувер мастера романтики",
+    "Пьянящая романтика": "современный любовный роман зарубежная сентиментальная проза бестселлеры хиты",
     "Шагнуть в портал": "эпическое фэнтези магия миры хиты продаж",
 }
 
@@ -208,7 +208,7 @@ def get_litres_books_list(category: str) -> tuple:
     return tuple(candidates)
 
 
-def get_litres_random_book(category: str) -> dict | None:
+def get_litres_random_book(category: str, exclude_hash: str | None = None) -> dict | None:
     """Возвращает ОДНУ случайную книгу из кэшированного списка ЛитРес.
 
     Список кандидатов берётся из get_litres_books_list (кэшируется через
@@ -216,12 +216,23 @@ def get_litres_random_book(category: str) -> dict | None:
     Поэтому повторные нажатия «Следующая книга» не бьют по API, а мгновенно
     выбирают другую книгу из уже загруженного в память списка.
 
+    exclude_hash — короткий хэш текущей (уже показанной) книги. Если передан,
+    эта книга исключается из пула выбора, чтобы «Следующая книга» никогда не
+    выдавала ту же книгу дважды подряд. Если после исключения список пуст
+    (в категории всего одна книга), откатываемся на полный список.
+
     При пустом кэше (таймаут/ошибка/нет книг) возвращает None — вызывающий
     код уходит в fallback на локальный books.json.
     """
     books = get_litres_books_list(category)
     if not books:
         return None
+    if exclude_hash:
+        filtered = [b for b in books if _book_hash(b) != exclude_hash]
+        # Если после исключения пул опустел — не ломаем выдачу,
+        # возвращаемся к полному списку (дубль лучше, чем пустота).
+        if filtered:
+            books = filtered
     return random.choice(books)
 
 
@@ -416,11 +427,9 @@ def show_shelf(chat_id: int, status: str = "saved") -> None:
     """Отправляет пользователю список книг с указанным статусом и кнопками управления."""
     books = get_user_books(chat_id, status)
     if not books:
-        status_label = "📚 Моя полка" if status == "saved" else "✅ Прочитанное"
         bot.send_message(
             chat_id,
-            f"{status_label} пока пусто. Откладывай понравившиеся книги кнопкой "
-            "«📥 На полку» под каждой рекомендацией.",
+            "Здесь пока пусто. Самое время найти хорошую книгу! 🍷",
             reply_markup=get_main_keyboard(),
         )
         return
@@ -537,7 +546,7 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("✅ Уже читал", callback_data=f"shelf_add_read_{book_hash}"),
     )
     kb.row(
-        types.InlineKeyboardButton("🔄 Следующая книга", callback_data="next_book"),
+        types.InlineKeyboardButton("🔄 Следующая книга", callback_data=f"next_book_{book_hash}"),
     )
     return kb
 
@@ -598,8 +607,11 @@ def _load_curated() -> dict:
     return _curated_cache
 
 
-def get_book_from_json(category: str) -> dict | None:
+def get_book_from_json(category: str, exclude_hash: str | None = None) -> dict | None:
     """Случайная книга из books.json по категории (fallback-источник).
+
+    exclude_hash — хэш текущей книги; если передан, книга с таким хэшем
+    исключается из выбора (защита от дублей в «Следующая книга»).
 
     Возвращает словарь в нашей схеме (Название, Автор, Описание, Послевкусие)
     или None, если для категории нет книг в подборке.
@@ -608,6 +620,18 @@ def get_book_from_json(category: str) -> dict | None:
     books = books_db.get(category, books_db.get("Лёгкость и смех"))
     if not books:
         return None
+    if exclude_hash:
+        filtered = [
+            b for b in books
+            if _book_hash({
+                "Название": b.get("title", "—"),
+                "Автор": b.get("author", "—"),
+            }) != exclude_hash
+        ]
+        # Если после исключения не осталось кандидатов — не ломаем
+        # выдачу, откатываемся к полному списку.
+        if filtered:
+            books = filtered
     b = random.choice(books)
     return {
         "Название": b.get("title", "—"),
@@ -697,7 +721,7 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
     return bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
 
 
-def send_recommendation(chat_id: int, category: str) -> None:
+def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = None) -> None:
     """Полный цикл поиска и отправки карточки книги по категории.
 
     Сначала пытаемся найти книгу по категории напрямую через ЛитРес
@@ -705,9 +729,12 @@ def send_recommendation(chat_id: int, category: str) -> None:
     или ничего не найдено — берём книгу из нашей подборки books.json
     (fallback). Используется и при первичном выборе настроения, и при
     нажатии кнопки «Следующая книга».
+
+    exclude_hash — хэш текущей книги; передаётся из callback_data кнопки
+    «Следующая книга», чтобы не выдать ту же книгу повторно.
     """
     # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
-    litres_book = get_litres_random_book(category)
+    litres_book = get_litres_random_book(category, exclude_hash=exclude_hash)
     if litres_book:
         shelf_kb = get_shelf_action_kb(litres_book)
         sent = _send_litres_card(chat_id, litres_book, shelf_kb)
@@ -715,7 +742,7 @@ def send_recommendation(chat_id: int, category: str) -> None:
         return
 
     # 2) Fallback: случайная книга из нашей подборки books.json.
-    book = get_book_from_json(category)
+    book = get_book_from_json(category, exclude_hash=exclude_hash)
     if not book:
         bot.send_message(
             chat_id,
@@ -763,15 +790,17 @@ def on_mood_selected(call):
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "next_book")
+@bot.callback_query_handler(func=lambda call: call.data == "next_book" or call.data.startswith("next_book_"))
 def on_next_book(call):
     """Обработка кнопки «Следующая книга» под рекомендацией.
 
-    Извлекает сохранённую категорию пользователя и заново запускает
-    весь цикл поиска (ЛитРес с фильтрами → fallback из books.json),
-    отправляя новую карточку книги отдельным сообщением (самый
-    стабильный UX для telebot: не зависит от типа медиа предыдущей
-    карточки — фото или текст).
+    Из callback_data извлекается хэш текущей (показанной) книги, чтобы
+    исключить её из пула выбора и не выдавать ту же книгу дважды подряд.
+    Категория берётся из сохранённого состояния пользователя. Весь цикл
+    поиска (ЛитРес с фильтрами → fallback из books.json) запускается заново,
+    отправляя новую карточку книги отдельным сообщением (самый стабильный
+    UX для telebot: не зависит от типа медиа предыдущей карточки — фото
+    или текст).
     """
     try:
         chat_id = call.message.chat.id
@@ -792,7 +821,16 @@ def on_next_book(call):
             )
             return
 
-        send_recommendation(chat_id, category)
+        # Извлекаем хэш текущей книги из callback_data (next_book_<hash>).
+        # Для обратной совместимости со старыми сообщениями без хэша
+        # (call.data == "next_book") exclude_hash остаётся None.
+        if call.data == "next_book":
+            exclude_hash = None
+        else:
+            parts = call.data.split("_", 2)
+            exclude_hash = parts[2] if len(parts) == 3 else None
+
+        send_recommendation(chat_id, category, exclude_hash=exclude_hash)
         bot.answer_callback_query(call.id)
     except Exception:
         # Любая непредвиденная ошибка (таймаут ЛитРес, 429 и т.д.) не
