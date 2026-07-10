@@ -36,6 +36,15 @@ CAPTION_LIMIT = 1024
 # --- База данных SQLite для полки пользователей ---
 DB_PATH = "books.db"
 
+class ShelfDBError(Exception):
+    """Ошибка доступа к БД полки пользователя (SQLite).
+
+    Оборачивает sqlite3.Error, чтобы вызывающий код (обработчики бота)
+    мог одним блоком перехватить сбой БД и уведомить пользователя,
+    не роняя бота и не провоцируя петлю 429 от Telegram.
+    """
+    pass
+
 def init_db() -> None:
     """Создаёт таблицу полки пользователей, если она не существует."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -61,9 +70,13 @@ def init_db() -> None:
 
 def get_db() -> sqlite3.Connection:
     """Возвращает подключение к БД с разрешённым доступом из разных потоков."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logger.error("Не удалось подключиться к БД: %s", e)
+        raise ShelfDBError() from e
 
 
 # --- Маппинг эмоциональных категорий на поисковые запросы ЛитРес ---
@@ -324,108 +337,145 @@ pending_book: dict[int, dict] = {}
 # приемлемо — пользователь просто заново выбирает настроение в меню.
 user_current_category: dict[int, str] = {}
 
+# Последняя показанная книга каждого пользователя (для кнопки «Следующая
+# книга»). Храним саму книгу в памяти процесса, чтобы НЕ класть ни название,
+# ни длинные строки в callback_data (жёсткий лимит Telegram — 64 байта).
+# В callback_data кнопки кладём только короткий экшен "next_book", а
+# идентификатор текущей книги достаём отсюда при обработке нажатия.
+user_last_book: dict[int, dict] = {}
+
 
 def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
     """Добавляет книгу на полку пользователя с указанным статусом.
     Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
-    conn = get_db()
     try:
-        cur = conn.execute(
-            "SELECT id FROM shelves WHERE chat_id = ? AND title = ?",
-            (str(chat_id), book.get("Название", "")),
-        )
-        if cur.fetchone():
-            return False
-        conn.execute(
-            "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (?, ?, ?, ?, ?)",
-            (
-                str(chat_id),
-                book.get("Название", ""),
-                book.get("Автор", ""),
-                book.get("Ссылка", ""),
-                status,
-            ),
-        )
-        conn.commit()
-        return True
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                "SELECT id FROM shelves WHERE chat_id = ? AND title = ?",
+                (str(chat_id), book.get("Название", "")),
+            )
+            if cur.fetchone():
+                return False
+            conn.execute(
+                "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(chat_id),
+                    book.get("Название", ""),
+                    book.get("Автор", ""),
+                    book.get("Ссылка", ""),
+                    status,
+                ),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.error("Ошибка БД (add_to_shelf): %s", e)
+        raise ShelfDBError() from e
 
 
 def remove_from_shelf(chat_id: int, book_id: int) -> bool:
     """Убирает книгу с полки пользователя по ID записи.
     Возвращает True, если книга была найдена и удалена."""
-    conn = get_db()
     try:
-        cur = conn.execute(
-            "DELETE FROM shelves WHERE id = ? AND chat_id = ?",
-            (book_id, str(chat_id)),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                "DELETE FROM shelves WHERE id = ? AND chat_id = ?",
+                (book_id, str(chat_id)),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.error("Ошибка БД (remove_from_shelf): %s", e)
+        raise ShelfDBError() from e
 
 
 def toggle_book_status(chat_id: int, book_id: int) -> str | None:
     """Меняет статус книги: saved <-> read. Возвращает новый статус или None."""
-    conn = get_db()
     try:
-        cur = conn.execute(
-            "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
-            (book_id, str(chat_id)),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        new_status = "read" if row["status"] == "saved" else "saved"
-        conn.execute(
-            "UPDATE shelves SET status = ? WHERE id = ?",
-            (new_status, book_id),
-        )
-        conn.commit()
-        return new_status
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
+                (book_id, str(chat_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            new_status = "read" if row["status"] == "saved" else "saved"
+            conn.execute(
+                "UPDATE shelves SET status = ? WHERE id = ?",
+                (new_status, book_id),
+            )
+            conn.commit()
+            return new_status
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.error("Ошибка БД (toggle_book_status): %s", e)
+        raise ShelfDBError() from e
 
 
 def clear_shelf(chat_id: int, status: str | None = None) -> bool:
     """Очищает полку пользователя (все статусы или только указанный).
     Возвращает True, если что-то было удалено."""
-    conn = get_db()
     try:
-        if status:
-            cur = conn.execute(
-                "DELETE FROM shelves WHERE chat_id = ? AND status = ?",
-                (str(chat_id), status),
-            )
-        else:
-            cur = conn.execute(
-                "DELETE FROM shelves WHERE chat_id = ?",
-                (str(chat_id),),
-            )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            if status:
+                cur = conn.execute(
+                    "DELETE FROM shelves WHERE chat_id = ? AND status = ?",
+                    (str(chat_id), status),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM shelves WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.error("Ошибка БД (clear_shelf): %s", e)
+        raise ShelfDBError() from e
 
 
 def get_user_books(chat_id: int, status: str) -> list[dict]:
     """Возвращает список книг пользователя с указанным статусом."""
-    conn = get_db()
     try:
-        cur = conn.execute(
-            "SELECT id, title, author, link, status FROM shelves WHERE chat_id = ? AND status = ? ORDER BY created_at DESC",
-            (str(chat_id), status),
-        )
-        return [dict(row) for row in cur.fetchall()]
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                "SELECT id, title, author, link, status FROM shelves WHERE chat_id = ? AND status = ? ORDER BY created_at DESC",
+                (str(chat_id), status),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.error("Ошибка БД (get_user_books): %s", e)
+        raise ShelfDBError() from e
 
 
 def show_shelf(chat_id: int, status: str = "saved") -> None:
     """Отправляет пользователю список книг с указанным статусом и кнопками управления."""
-    books = get_user_books(chat_id, status)
+    try:
+        books = get_user_books(chat_id, status)
+    except ShelfDBError:
+        # Сбой БД не должен ронять бота и провоцировать петлю 429:
+        # просто сообщаем пользователю и завершаем.
+        bot.send_message(
+            chat_id,
+            "Упс, полка временно недоступна 🛠 Попробуй чуть позже — мы уже чиним погреб.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
     if not books:
         bot.send_message(
             chat_id,
@@ -546,7 +596,7 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("✅ Уже читал", callback_data=f"shelf_add_read_{book_hash}"),
     )
     kb.row(
-        types.InlineKeyboardButton("🔄 Следующая книга", callback_data=f"next_book_{book_hash}"),
+        types.InlineKeyboardButton("🔄 Следующая книга", callback_data="next_book"),
     )
     return kb
 
@@ -739,6 +789,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         shelf_kb = get_shelf_action_kb(litres_book)
         sent = _send_litres_card(chat_id, litres_book, shelf_kb)
         pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
+        user_last_book[chat_id] = litres_book
         return
 
     # 2) Fallback: случайная книга из нашей подборки books.json.
@@ -770,6 +821,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
 
     pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
+    user_last_book[chat_id] = book
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
@@ -790,17 +842,16 @@ def on_mood_selected(call):
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "next_book" or call.data.startswith("next_book_"))
+@bot.callback_query_handler(func=lambda call: call.data == "next_book")
 def on_next_book(call):
     """Обработка кнопки «Следующая книга» под рекомендацией.
 
-    Из callback_data извлекается хэш текущей (показанной) книги, чтобы
-    исключить её из пула выбора и не выдавать ту же книгу дважды подряд.
-    Категория берётся из сохранённого состояния пользователя. Весь цикл
-    поиска (ЛитРес с фильтрами → fallback из books.json) запускается заново,
-    отправляя новую карточку книги отдельным сообщением (самый стабильный
-    UX для telebot: не зависит от типа медиа предыдущей карточки — фото
-    или текст).
+    В callback_data передаётся только короткий экшен "next_book" (строго
+    в лимите 64 байт Telegram). Идентификатор текущей (показанной) книги
+    берётся из словаря состояний user_last_book[chat_id], чтобы исключить
+    её из пула выбора и не выдавать ту же книгу дважды подряд. Категория —
+    из user_current_category. Весь цикл поиска (ЛитРес → fallback books.json)
+    запускается заново, отправляя новую карточку отдельным сообщением.
     """
     try:
         chat_id = call.message.chat.id
@@ -821,14 +872,11 @@ def on_next_book(call):
             )
             return
 
-        # Извлекаем хэш текущей книги из callback_data (next_book_<hash>).
-        # Для обратной совместимости со старыми сообщениями без хэша
-        # (call.data == "next_book") exclude_hash остаётся None.
-        if call.data == "next_book":
-            exclude_hash = None
-        else:
-            parts = call.data.split("_", 2)
-            exclude_hash = parts[2] if len(parts) == 3 else None
+        # Берём последнюю показанную книгу из словаря состояний (без
+        # длинных строк в callback_data) и исключаем её из выдачи, чтобы
+        # не выдать ту же книгу дважды подряд.
+        last_book = user_last_book.get(chat_id)
+        exclude_hash = _book_hash(last_book) if last_book else None
 
         send_recommendation(chat_id, category, exclude_hash=exclude_hash)
         bot.answer_callback_query(call.id)
@@ -862,7 +910,11 @@ def on_shelf_add(call):
         return
 
     book = pending["book"]
-    added = add_to_shelf(call.message.chat.id, book, status=status)
+    try:
+        added = add_to_shelf(call.message.chat.id, book, status=status)
+    except ShelfDBError:
+        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        return
     if added:
         status_label = "📥 Добавлено на полку!" if status == "saved" else "✅ Отмечено как прочитанное!"
         bot.answer_callback_query(call.id, status_label)
@@ -906,7 +958,11 @@ def on_shelf_clear_confirm(call):
         bot.answer_callback_query(call.id, "Некорректный статус.")
         return
 
-    cleared = clear_shelf(call.message.chat.id, status=status)
+    try:
+        cleared = clear_shelf(call.message.chat.id, status=status)
+    except ShelfDBError:
+        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        return
     if cleared:
         status_text = "🧹 Полка очищена." if status == "saved" else "🧹 Список прочитанного очищен."
         bot.answer_callback_query(call.id, status_text)
@@ -952,7 +1008,11 @@ def on_shelf_toggle(call):
         bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
         return
 
-    new_status = toggle_book_status(call.message.chat.id, book_id)
+    try:
+        new_status = toggle_book_status(call.message.chat.id, book_id)
+    except ShelfDBError:
+        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        return
     if not new_status:
         bot.answer_callback_query(call.id, "Книга не найдена.")
         return
@@ -973,18 +1033,23 @@ def on_shelf_delete(call):
         return
 
     # Определяем статус книги перед удалением, чтобы обновить правильный список
-    conn = get_db()
     try:
-        cur = conn.execute(
-            "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
-            (book_id, str(call.message.chat.id)),
-        )
-        row = cur.fetchone()
-        status = row["status"] if row else "saved"
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            cur = conn.execute(
+                "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
+                (book_id, str(call.message.chat.id)),
+            )
+            row = cur.fetchone()
+            status = row["status"] if row else "saved"
+        finally:
+            conn.close()
 
-    removed = remove_from_shelf(call.message.chat.id, book_id)
+        removed = remove_from_shelf(call.message.chat.id, book_id)
+    except ShelfDBError:
+        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        return
+
     if removed:
         bot.answer_callback_query(call.id, "🗑 Книга удалена.")
         show_shelf(call.message.chat.id, status=status)
@@ -1000,47 +1065,26 @@ PORT = int(os.environ.get('PORT', 5000))
 app = Flask(__name__)
 
 
-@app.route('/' + TOKEN, methods=['POST'])
+@app.route('/', methods=['POST'])
 def webhook():
-    """Принимаем обновления от Telegram.
-
-    Железобетонный обработчик: что бы ни случилось внутри бота
-    (KeyError, таймаут API ЛитРес, ошибки Telegram API, включая
-    429 Too Many Requests), функция перехватывает исключение,
-    логирует его и ВСЕГДА возвращает "OK", 200, чтобы Telegram
-    не пытался бесконечно переотправлять апдейт и не усугублял
-    нагрузку (и без того возможную 429-ошибку).
-    """
     try:
-        if request.headers.get('content-type') != 'application/json':
-            return 'OK', 200
-
         json_string = request.get_data().decode('utf-8')
-        try:
-            update = telebot.types.Update.de_json(json_string)
-        except Exception:
-            traceback.print_exc()
-            logger.error("Не удалось распарсить обновление от Telegram", exc_info=True)
-            return 'OK', 200
-
+        update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
-    except Exception:
-        # Любая ошибка внутри обработчиков (429, таймаут, KeyError и т.д.)
-        # логируется, но НЕ прерывает ответ вебхука.
+    except Exception as e:
+        import traceback
         traceback.print_exc()
-        logger.error("Ошибка при обработке обновления в webhook", exc_info=True)
-
-    # Строгое правило: при любом исходе отвечаем Telegram кодом 200.
-    return 'OK', 200
+    finally:
+        return "OK", 200
 
 
 @app.route('/')
 def index():
     """Устанавливаем webhook при старте/деплое."""
     bot.remove_webhook()
-    success = bot.set_webhook(url=APP_URL + TOKEN)
+    success = bot.set_webhook(url=APP_URL)
     if success:
-        return f'Webhook установлен: {APP_URL + TOKEN}', 200
+        return f'Webhook установлен: {APP_URL}', 200
     else:
         return 'Не удалось установить webhook', 500
 
