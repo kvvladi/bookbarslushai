@@ -6,6 +6,7 @@ import sqlite3
 import traceback
 import hashlib
 import requests
+from functools import lru_cache
 import telebot
 from telebot import types
 from dotenv import load_dotenv
@@ -91,22 +92,23 @@ MOOD_TO_LITRES = {
 LITRES_TOP_N = 20
 
 
-def get_litres_random_book(category: str) -> dict | None:
-    """Ищет случайную книгу по категории напрямую через API ЛитРес.
+@lru_cache(maxsize=32)
+def get_litres_books_list(category: str) -> tuple:
+    """Возвращает КЭШИРУЕМЫЙ список (топ-LITRES_TOP_N) кандидатов по категории.
 
-    Берёт ключевые слова для категории из MOOD_TO_LITRES, делает запрос к
-    поисковому API с сортировкой по популярности (sort=popular) и выбирает
-    случайную книгу из топа-LITRES_TOP_N самых популярных результатов.
+    ВАЖНО (оптимизация производительности): кэшируется именно СПИСОК книг,
+    а не финальная выдача. Случайный выбор (random.choice) происходит ВНЕ этой
+    функции (см. get_litres_random_book), поэтому при нажатии «Следующая книга»
+    пользователь мгновенно получает новую книгу из уже сохранённого в памяти
+    списка — без повторного HTTP-запроса к ЛитРес.
 
-    Возвращает словарь, нормализованный под нашу схему книги:
-        - Название, Автор, Ссылка — для полки и отображения,
-        - Описание               — аннотация/подзаголовок с ЛитРес,
-        - cover_url, rating, book_url — данные для карточки.
-    При ошибке запроса или отсутствии книг — возвращает None (fallback).
+    Жёсткий таймаут 2.5с: при requests.exceptions.Timeout (или любой другой
+    ошибке сети/JSON) возвращаем пустой кортеж, и вызывающий код мгновенно
+    уходит в fallback на локальный books.json (защита от 429/тормозов).
     """
     query = MOOD_TO_LITRES.get(category)
     if not query:
-        return None
+        return tuple()
 
     params = {
         "q": query,
@@ -116,17 +118,24 @@ def get_litres_random_book(category: str) -> dict | None:
     }
 
     try:
-        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=10)
+        # ЖЁСТКИЙ ТАЙМАУТ 2.5с: если ЛитРес не ответил — падаем в Timeout,
+        # чтобы бот мгновенно выдал книгу из локального books.json.
+        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=2.5)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.Timeout:
+        # ЛитРес не уложился в 2.5с — мгновенный fallback на books.json.
+        logger.warning("ЛитРес не ответил за 2.5с (timeout) для категории %r", category)
+        return tuple()
     except (requests.RequestException, ValueError):
         # Сеть недоступна / API вернул не-JSON / некорректный статус.
-        return None
+        logger.warning("Ошибка запроса к ЛитРес для категории %r", category)
+        return tuple()
 
     payload = data.get("payload") or {}
     items = payload.get("data") or []
     if not items:
-        return None
+        return tuple()
 
     # Жёсткий фильтр качества: оставляем только книги с рейтингом >= 3.5.
     # Рейтинг 0, None или ниже 3.5 (включая неоценённые самоиздаты и слабые
@@ -146,15 +155,14 @@ def get_litres_random_book(category: str) -> dict | None:
 
     items = [item for item in items if _has_valid_rating(item)]
     if not items:
-        # Ни одной книги с рейтингом не найдено — возвращаем None,
+        # Ни одной книги с рейтингом не найдено — возвращаем пусто,
         # чтобы сработал стандартный fallback (выдача из books.json).
-        return None
+        return tuple()
 
     # Берём только топ-LITRES_TOP_N самых популярных книг из ответа API
-    # (выдача уже отсортирована по популярности через sort=popular) и из
-    # этого «элитного» списка выбираем одну случайную книгу.
+    # (выдача уже отсортирована по популярности через sort=popular).
     # Сначала оставляем только те, у которых есть обложка, чтобы не возвращать
-    # None из-за отсутствия картинки у случайно выбранного элемента.
+    # пустые карточки из-за отсутствия картинки у случайно выбранного элемента.
     candidates = []
     for item in items[:LITRES_TOP_N]:
         inst = item.get("instance") or {}
@@ -195,9 +203,26 @@ def get_litres_random_book(category: str) -> dict | None:
             "rating": rating,
             "book_url": book_url,
         })
-    if not candidates:
+    # Возвращаем КОРТЕЖ (иммутабельно — безопасно для lru_cache),
+    # чтобы random.choice происходил уже вне кэшированной функции.
+    return tuple(candidates)
+
+
+def get_litres_random_book(category: str) -> dict | None:
+    """Возвращает ОДНУ случайную книгу из кэшированного списка ЛитРес.
+
+    Список кандидатов берётся из get_litres_books_list (кэшируется через
+    @lru_cache), а random.choice происходит ЗДЕСЬ, ВНЕ кэшированной функции.
+    Поэтому повторные нажатия «Следующая книга» не бьют по API, а мгновенно
+    выбирают другую книгу из уже загруженного в память списка.
+
+    При пустом кэше (таймаут/ошибка/нет книг) возвращает None — вызывающий
+    код уходит в fallback на локальный books.json.
+    """
+    books = get_litres_books_list(category)
+    if not books:
         return None
-    return random.choice(candidates)
+    return random.choice(books)
 
 
 def _build_litres_caption(book: dict) -> str:
@@ -604,9 +629,15 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
     query = f"{title} {author}".strip() if author else title
     params = {"q": query, "types": "text_book", "limit": 5}
     try:
-        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=10)
+        # Жёсткий таймаут 2.5с: при превышении — мгновенный отказ от
+        # обогащения обложкой, книга отправится текстом (fallback).
+        resp = requests.get(LITRES_SEARCH_API, params=params, timeout=2.5)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.Timeout:
+        # ЛитРес не ответил за 2.5с — не обогащаем, возвращаем None.
+        logger.warning("ЛитРес не ответил за 2.5с (timeout) при обогащении %r", title)
+        return None
     except (requests.RequestException, ValueError):
         return None
 
@@ -722,6 +753,9 @@ def on_mood_selected(call):
     запускаем полный цикл поиска/отправки рекомендации.
     """
     category = call.data[len("mood_"):]
+    # Мгновенная обратная связь: показываем, что бот начал работу, и
+    # предотвращаем повторные клики, пока идёт (возможно кэшированный) поиск.
+    bot.send_chat_action(call.message.chat.id, 'upload_photo')
     # Сохраняем текущее настроение, чтобы кнопка «Следующая книга»
     # могла заново запустить поиск в той же категории.
     user_current_category[call.message.chat.id] = category
@@ -741,6 +775,9 @@ def on_next_book(call):
     """
     try:
         chat_id = call.message.chat.id
+        # Мгновенная обратная связь ДО начала поиска: показываем, что бот
+        # работает, и предотвращаем повторные клики «Следующая книга».
+        bot.send_chat_action(chat_id, 'upload_photo')
         # Безопасное извлечение категории: при перезагрузке сервера
         # словарь в памяти пуст, .get() вернёт None вместо KeyError.
         category = user_current_category.get(chat_id)
