@@ -710,20 +710,33 @@ def on_next_book(call):
     стабильный UX для telebot: не зависит от типа медиа предыдущей
     карточки — фото или текст).
     """
-    chat_id = call.message.chat.id
-    category = user_current_category.get(chat_id)
-    if not category:
-        # Пользователь ещё не выбирал настроение в этой сессии.
-        bot.answer_callback_query(call.id, "Сначала выбери настроение 🎭")
-        bot.send_message(
-            chat_id,
-            "Чтобы получать рекомендации, сначала выбери настроение 👇",
-            reply_markup=get_mood_inline_keyboard(),
-        )
-        return
+    try:
+        chat_id = call.message.chat.id
+        # Безопасное извлечение категории: при перезагрузке сервера
+        # словарь в памяти пуст, .get() вернёт None вместо KeyError.
+        category = user_current_category.get(chat_id)
+        if not category:
+            # Пользователь ещё не выбирал настроение в этой сессии
+            # (или бот перезагрузился) — просим выбрать заново.
+            bot.answer_callback_query(call.id, "Сначала выбери настроение 🎭")
+            bot.send_message(
+                chat_id,
+                "Выберите настроение заново в главном меню 👇",
+                reply_markup=get_mood_inline_keyboard(),
+            )
+            return
 
-    send_recommendation(chat_id, category)
-    bot.answer_callback_query(call.id)
+        send_recommendation(chat_id, category)
+        bot.answer_callback_query(call.id)
+    except Exception:
+        # Любая непредвиденная ошибка (таймаут ЛитРес, 429 и т.д.) не
+        # должна ронять обработчик — логируем и спокойно завершаем.
+        traceback.print_exc()
+        logger.error("Ошибка в обработчике on_next_book", exc_info=True)
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_add_"))
@@ -767,11 +780,17 @@ def on_shelf_clear(call):
         types.InlineKeyboardButton("✅ Да, очистить", callback_data=f"shelf_clear_confirm_{status}"),
         types.InlineKeyboardButton("❌ Нет, оставить", callback_data=f"shelf_clear_cancel_{status}"),
     )
-    bot.edit_message_reply_markup(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=confirm_kb,
-    )
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=confirm_kb,
+        )
+    except telebot.apihelper.ApiTelegramException as e:
+        # Игнорируем «message is not modified» — это не ошибка логики,
+        # а всего лишь уведомление, что клавиатура уже такая же.
+        if "message is not modified" not in str(e):
+            logger.warning("Не удалось обновить клавиатуру: %s", e)
     bot.answer_callback_query(call.id)
 
 
@@ -787,11 +806,15 @@ def on_shelf_clear_confirm(call):
     if cleared:
         status_text = "🧹 Полка очищена." if status == "saved" else "🧹 Список прочитанного очищен."
         bot.answer_callback_query(call.id, status_text)
-        bot.edit_message_text(
-            f"{status_text} Откладывай новые книги кнопкой «📥 На полку» под рекомендациями.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
+        try:
+            bot.edit_message_text(
+                f"{status_text} Откладывай новые книги кнопкой «📥 На полку» под рекомендациями.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" not in str(e):
+                logger.warning("Не удалось отредактировать сообщение: %s", e)
     else:
         bot.answer_callback_query(call.id, "Уже пусто.")
     bot.send_message(
@@ -805,11 +828,15 @@ def on_shelf_clear_confirm(call):
 def on_shelf_clear_cancel(call):
     """Отмена очистки полки или прочитанного."""
     bot.answer_callback_query(call.id, "Оставили как есть.")
-    bot.edit_message_text(
-        "Хорошо, оставили как есть. 📚",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-    )
+    try:
+        bot.edit_message_text(
+            "Хорошо, оставили как есть. 📚",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            logger.warning("Не удалось отредактировать сообщение: %s", e)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_toggle_"))
@@ -871,23 +898,35 @@ app = Flask(__name__)
 
 @app.route('/' + TOKEN, methods=['POST'])
 def webhook():
-    """Принимаем обновления от Telegram."""
-    if request.headers.get('content-type') != 'application/json':
-        return 'Invalid content type', 400
+    """Принимаем обновления от Telegram.
 
-    json_string = request.get_data().decode('utf-8')
+    Железобетонный обработчик: что бы ни случилось внутри бота
+    (KeyError, таймаут API ЛитРес, ошибки Telegram API, включая
+    429 Too Many Requests), функция перехватывает исключение,
+    логирует его и ВСЕГДА возвращает "OK", 200, чтобы Telegram
+    не пытался бесконечно переотправлять апдейт и не усугублял
+    нагрузку (и без того возможную 429-ошибку).
+    """
     try:
-        update = telebot.types.Update.de_json(json_string)
-    except Exception:
-        traceback.print_exc()
-        logger.error("Не удалось распарсить обновление от Telegram", exc_info=True)
-        return 'OK', 200
+        if request.headers.get('content-type') != 'application/json':
+            return 'Invalid content type', 400
 
-    try:
+        json_string = request.get_data().decode('utf-8')
+        try:
+            update = telebot.types.Update.de_json(json_string)
+        except Exception:
+            traceback.print_exc()
+            logger.error("Не удалось распарсить обновление от Telegram", exc_info=True)
+            return 'OK', 200
+
         bot.process_new_updates([update])
     except Exception:
+        # Любая ошибка внутри обработчиков (429, таймаут, KeyError и т.д.)
+        # логируется, но НЕ прерывает ответ вебхука.
         traceback.print_exc()
         logger.error("Ошибка при обработке обновления в webhook", exc_info=True)
+
+    # Строгое правило: при любом исходе отвечаем Telegram кодом 200.
     return 'OK', 200
 
 
