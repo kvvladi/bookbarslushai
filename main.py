@@ -2,6 +2,9 @@ import os
 import json
 import random
 import logging
+import sqlite3
+import traceback
+import hashlib
 import requests
 import telebot
 from telebot import types
@@ -28,6 +31,38 @@ LITRES_CDN = "https://cdn.litres.ru"        # хост обложек (без р
 
 # Лимит длины подписи (caption) в Telegram — 1024 символа.
 CAPTION_LIMIT = 1024
+
+# --- База данных SQLite для полки пользователей ---
+DB_PATH = "books.db"
+
+def init_db() -> None:
+    """Создаёт таблицу полки пользователей, если она не существует."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shelves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                author TEXT,
+                link TEXT,
+                status TEXT NOT NULL DEFAULT 'saved',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shelves_chat_status
+            ON shelves (chat_id, status)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_db() -> sqlite3.Connection:
+    """Возвращает подключение к БД с разрешённым доступом из разных потоков."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 # --- Маппинг эмоциональных категорий на поисковые запросы ЛитРес ---
@@ -99,7 +134,7 @@ def get_litres_random_book(category: str) -> dict | None:
     cover = instance.get("cover_url")
     authors = [
         p.get("full_name")
-        for p in persons
+        for p in (item.get("persons") or [])
         if p.get("role") == "author" and p.get("full_name")
     ]
     author = ", ".join(authors) if authors else "Неизвестный автор"
@@ -111,16 +146,19 @@ def get_litres_random_book(category: str) -> dict | None:
     # (часто это описание серии/издания). Пустые значения позже заменяются
     # на короткую заметку при формировании карточки.
     annotation = (instance.get("subtitle") or "").strip()
+    book_url = instance.get("url") or ""
+    if book_url.startswith("/"):
+        book_url = LITRES_BASE + book_url
 
     return {
         "Название": instance.get("title", "—"),
         "Автор": author,
-        "Ссылка": url,
+        "Ссылка": book_url,
         "Описание": annotation,
         "Послевкусие": "",
         "cover_url": cover,
         "rating": rating,
-        "book_url": url,
+        "book_url": book_url,
     }
 
 
@@ -191,97 +229,158 @@ def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
 
 
 # --- Полки пользователей (отложенные книги) ---
-SHELVES_FILE = "shelves.json"
-# Полки: chat_id (str) -> [ {Название, Автор, Ссылка}, ... ]
-shelves: dict[str, list[dict]] = {}
-if os.path.exists(SHELVES_FILE):
-    try:
-        with open(SHELVES_FILE, "r", encoding="utf-8") as _f:
-            shelves = json.load(_f)
-    except (json.JSONDecodeError, OSError):
-        shelves = {}
-
 # Книга, показанная в конкретном сообщении (по message_id), чтобы кнопка
-# «Отложить на полку» добавляла именно её, а не последнюю показанную.
+# «На полку» / «Уже читал» добавляла именно её, а не последнюю показанную.
 pending_book: dict[int, dict] = {}
 
 
-def save_shelves() -> None:
-    with open(SHELVES_FILE, "w", encoding="utf-8") as _f:
-        json.dump(shelves, _f, ensure_ascii=False, indent=2)
+def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
+    """Добавляет книгу на полку пользователя с указанным статусом.
+    Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT id FROM shelves WHERE chat_id = ? AND title = ?",
+            (str(chat_id), book.get("Название", "")),
+        )
+        if cur.fetchone():
+            return False
+        conn.execute(
+            "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(chat_id),
+                book.get("Название", ""),
+                book.get("Автор", ""),
+                book.get("Ссылка", ""),
+                status,
+            ),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
-def add_to_shelf(chat_id: int, book: dict) -> bool:
-    """Добавляет книгу на полку пользователя. Возвращает False, если уже есть
-    (дедуп по названию)."""
-    cid = str(chat_id)
-    shelf = shelves.setdefault(cid, [])
-    if any(b.get("Название") == book.get("Название") for b in shelf):
-        return False
-    shelf.append({
-        "Название": book.get("Название"),
-        "Автор": book.get("Автор"),
-        "Ссылка": book.get("Ссылка", ""),
-    })
-    save_shelves()
-    return True
-
-
-def remove_from_shelf(chat_id: int, book: dict) -> bool:
-    """Убирает книгу с полки пользователя (дедуп по названию).
+def remove_from_shelf(chat_id: int, book_id: int) -> bool:
+    """Убирает книгу с полки пользователя по ID записи.
     Возвращает True, если книга была найдена и удалена."""
-    cid = str(chat_id)
-    shelf = shelves.get(cid)
-    if not shelf:
-        return False
-    new_shelf = [b for b in shelf if b.get("Название") != book.get("Название")]
-    if len(new_shelf) == len(shelf):
-        return False
-    shelves[cid] = new_shelf
-    save_shelves()
-    return True
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM shelves WHERE id = ? AND chat_id = ?",
+            (book_id, str(chat_id)),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
-def clear_shelf(chat_id: int) -> bool:
-    """Полностью очищает полку пользователя. Возвращает True, если на полке
-    что-то было."""
-    cid = str(chat_id)
-    if not shelves.get(cid):
-        return False
-    shelves[cid] = []
-    save_shelves()
-    return True
+def toggle_book_status(chat_id: int, book_id: int) -> str | None:
+    """Меняет статус книги: saved <-> read. Возвращает новый статус или None."""
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
+            (book_id, str(chat_id)),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        new_status = "read" if row["status"] == "saved" else "saved"
+        conn.execute(
+            "UPDATE shelves SET status = ? WHERE id = ?",
+            (new_status, book_id),
+        )
+        conn.commit()
+        return new_status
+    finally:
+        conn.close()
 
 
-def show_shelf(chat_id: int) -> None:
-    """Отправляет пользователю список отложенных книг с inline-кнопкой очистки."""
-    shelf = shelves.get(str(chat_id), [])
-    if not shelf:
+def clear_shelf(chat_id: int, status: str | None = None) -> bool:
+    """Очищает полку пользователя (все статусы или только указанный).
+    Возвращает True, если что-то было удалено."""
+    conn = get_db()
+    try:
+        if status:
+            cur = conn.execute(
+                "DELETE FROM shelves WHERE chat_id = ? AND status = ?",
+                (str(chat_id), status),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM shelves WHERE chat_id = ?",
+                (str(chat_id),),
+            )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_user_books(chat_id: int, status: str) -> list[dict]:
+    """Возвращает список книг пользователя с указанным статусом."""
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT id, title, author, link, status FROM shelves WHERE chat_id = ? AND status = ? ORDER BY created_at DESC",
+            (str(chat_id), status),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def show_shelf(chat_id: int, status: str = "saved") -> None:
+    """Отправляет пользователю список книг с указанным статусом и кнопками управления."""
+    books = get_user_books(chat_id, status)
+    if not books:
+        status_label = "📚 Моя полка" if status == "saved" else "✅ Прочитанное"
         bot.send_message(
             chat_id,
-            "📚 Твоя полка пока пуста. Откладывай понравившиеся книги кнопкой "
-            "«📌 Отложить на полку» под каждой рекомендацией.",
+            f"{status_label} пока пусто. Откладывай понравившиеся книги кнопкой "
+            "«📥 На полку» под каждой рекомендацией.",
             reply_markup=get_main_keyboard(),
         )
         return
+
     lines = []
-    for i, b in enumerate(shelf, 1):
-        title = b.get("Название", "—")
-        author = b.get("Автор", "—")
-        link = b.get("Ссылка")
+    for i, b in enumerate(books, 1):
+        title = b.get("title", "—")
+        author = b.get("author", "—")
+        link = b.get("link")
         if link:
             lines.append(f"{i}. <a href=\"{link}\">{title}</a> — {author}")
         else:
             lines.append(f"{i}. {title} — {author}")
-    shelf_kb = types.InlineKeyboardMarkup()
-    shelf_kb.row(
-        types.InlineKeyboardButton("🧹 Очистить полку", callback_data="shelf_clear"),
-    )
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for b in books:
+        book_id = b["id"]
+        current_status = b["status"]
+        # Кнопка смены статуса
+        toggle_label = "✅ В прочитанное" if current_status == "saved" else "📥 На полку"
+        toggle_callback = f"shelf_toggle_{book_id}"
+        # Кнопка удаления
+        delete_callback = f"shelf_delete_{book_id}"
+        kb.row(
+            types.InlineKeyboardButton(toggle_label, callback_data=toggle_callback),
+            types.InlineKeyboardButton("🗑 Удалить", callback_data=delete_callback),
+        )
+
+    status_label = "📚 <b>Моя полка:</b>" if status == "saved" else "✅ <b>Прочитанное:</b>"
+
+    # Кнопка очистки всего списка
+    clear_callback = f"shelf_clear_{status}"
+    clear_label = "🧹 Очистить полку" if status == "saved" else "🧹 Очистить прочитанное"
+    kb.row(types.InlineKeyboardButton(clear_label, callback_data=clear_callback))
+
     bot.send_message(
         chat_id,
-        "📚 <b>Твоя полка:</b>\n\n" + "\n".join(lines),
+        f"{status_label}\n\n" + "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=shelf_kb,
+        reply_markup=kb,
     )
 
 
@@ -313,7 +412,8 @@ def get_main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     btn_mood = types.KeyboardButton("🎭 Выбрать настроение")
     btn_shelf = types.KeyboardButton("📚 Моя полка")
-    keyboard.add(btn_mood, btn_shelf)
+    btn_read = types.KeyboardButton("✅ Прочитанное")
+    keyboard.add(btn_mood, btn_shelf, btn_read)
     return keyboard
 
 
@@ -334,6 +434,24 @@ def get_mood_inline_keyboard():
     return keyboard
 
 
+def _book_hash(book: dict) -> str:
+    """Короткий хэш книги для callback_data (не превышает лимит Telegram)."""
+    title = book.get("Название", "")
+    author = book.get("Автор", "")
+    return hashlib.md5(f"{title}{author}".encode()).hexdigest()[:10]
+
+
+def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
+    """Клавиатура с кнопками «На полку» и «Уже читал» под рекомендацией."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    book_hash = _book_hash(book)
+    kb.row(
+        types.InlineKeyboardButton("📥 На полку", callback_data=f"shelf_add_saved_{book_hash}"),
+        types.InlineKeyboardButton("✅ Уже читал", callback_data=f"shelf_add_read_{book_hash}"),
+    )
+    return kb
+
+
 # --- Обработчики бота ---
 
 @bot.message_handler(commands=["start"])
@@ -347,7 +465,12 @@ def handle_main_menu(message):
 
     # Просмотр полки отложенных книг
     if text == "📚 Моя полка":
-        show_shelf(message.chat.id)
+        show_shelf(message.chat.id, status="saved")
+        return
+
+    # Просмотр прочитанных книг
+    if text == "✅ Прочитанное":
+        show_shelf(message.chat.id, status="read")
         return
 
     # Открытие меню выбора настроения
@@ -476,13 +599,9 @@ def on_mood_selected(call):
     # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
     litres_book = get_litres_random_book(category)
     if litres_book:
-        shelf_kb = types.InlineKeyboardMarkup()
-        shelf_kb.row(
-            types.InlineKeyboardButton("📌 Отложить на полку", callback_data="shelf_add"),
-            types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
-        )
+        shelf_kb = get_shelf_action_kb(litres_book)
         sent = _send_litres_card(call.message.chat.id, litres_book, shelf_kb)
-        pending_book[sent.message_id] = litres_book
+        pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
         bot.answer_callback_query(call.id)
         return
 
@@ -498,12 +617,7 @@ def on_mood_selected(call):
         )
         return
 
-    # Inline-кнопки под каждой рекомендацией: отложить на полку и убрать с полки
-    shelf_kb = types.InlineKeyboardMarkup()
-    shelf_kb.row(
-        types.InlineKeyboardButton("📌 Отложить на полку", callback_data="shelf_add"),
-        types.InlineKeyboardButton("🗑 Убрать с полки", callback_data="shelf_remove"),
-    )
+    shelf_kb = get_shelf_action_kb(book)
 
     # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
     # чтобы показать её в том же «карточном» формате, что и основную выдачу.
@@ -520,48 +634,50 @@ def on_mood_selected(call):
         intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
         sent = _send_book_text(call.message.chat.id, book, intro_text, shelf_kb)
 
-    pending_book[sent.message_id] = book
+    pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "shelf_add")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_add_"))
 def on_shelf_add(call):
-    """Обработка кнопки «Отложить на полку» под рекомендацией."""
-    book = pending_book.get(call.message.message_id)
-    if not book:
+    """Обработка кнопок «На полку» и «Уже читал» под рекомендацией."""
+    parts = call.data.split("_", 3)
+    if len(parts) != 4:
+        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        return
+    status = parts[2]  # saved или read
+    expected_hash = parts[3]
+
+    pending = pending_book.get(call.message.message_id)
+    if not pending:
         bot.answer_callback_query(call.id, "Книга уже недоступна для добавления.")
         return
-    added = add_to_shelf(call.message.chat.id, book)
+    if pending.get("hash") != expected_hash:
+        bot.answer_callback_query(call.id, "Книга уже недоступна для добавления.")
+        return
+
+    book = pending["book"]
+    added = add_to_shelf(call.message.chat.id, book, status=status)
     if added:
-        bot.answer_callback_query(call.id, "📌 Добавлено на полку!")
+        status_label = "📥 Добавлено на полку!" if status == "saved" else "✅ Отмечено как прочитанное!"
+        bot.answer_callback_query(call.id, status_label)
     else:
-        bot.answer_callback_query(call.id, "Эта книга уже на твоей полке.")
+        bot.answer_callback_query(call.id, "Эта книга уже есть у тебя.")
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "shelf_remove")
-def on_shelf_remove(call):
-    """Обработка кнопки «Убрать с полки» под рекомендацией."""
-    book = pending_book.get(call.message.message_id)
-    if not book:
-        bot.answer_callback_query(call.id, "Книга уже недоступна для удаления.")
-        return
-    removed = remove_from_shelf(call.message.chat.id, book)
-    if removed:
-        bot.answer_callback_query(call.id, "🗑 Убрано с полки.")
-    else:
-        bot.answer_callback_query(call.id, "Этой книги и так нет на полке.")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "shelf_clear")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_"))
 def on_shelf_clear(call):
-    """Обработка inline-кнопки «Очистить полку» из просмотра полки."""
-    if not shelves.get(str(call.message.chat.id)):
-        bot.answer_callback_query(call.id, "Полка уже пуста.")
+    """Обработка inline-кнопки «Очистить полку» / «Очистить прочитанное»."""
+    status = call.data[len("shelf_clear_"):]
+    if status not in ("saved", "read"):
+        bot.answer_callback_query(call.id, "Некорректный статус.")
         return
+
+    status_label = "полка" if status == "saved" else "список прочитанного"
     confirm_kb = types.InlineKeyboardMarkup()
     confirm_kb.row(
-        types.InlineKeyboardButton("✅ Да, очистить", callback_data="shelf_clear_confirm"),
-        types.InlineKeyboardButton("❌ Нет, оставить", callback_data="shelf_clear_cancel"),
+        types.InlineKeyboardButton("✅ Да, очистить", callback_data=f"shelf_clear_confirm_{status}"),
+        types.InlineKeyboardButton("❌ Нет, оставить", callback_data=f"shelf_clear_cancel_{status}"),
     )
     bot.edit_message_reply_markup(
         chat_id=call.message.chat.id,
@@ -571,20 +687,25 @@ def on_shelf_clear(call):
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "shelf_clear_confirm")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_confirm_"))
 def on_shelf_clear_confirm(call):
-    """Подтверждение очистки полки."""
-    cleared = clear_shelf(call.message.chat.id)
+    """Подтверждение очистки полки или прочитанного."""
+    status = call.data[len("shelf_clear_confirm_"):]
+    if status not in ("saved", "read"):
+        bot.answer_callback_query(call.id, "Некорректный статус.")
+        return
+
+    cleared = clear_shelf(call.message.chat.id, status=status)
     if cleared:
-        bot.answer_callback_query(call.id, "🧹 Полка очищена.")
+        status_text = "🧹 Полка очищена." if status == "saved" else "🧹 Список прочитанного очищен."
+        bot.answer_callback_query(call.id, status_text)
         bot.edit_message_text(
-            "🧹 Полка очищена. Откладывай новые книги кнопкой "
-            "«📌 Отложить на полку» под рекомендациями.",
+            f"{status_text} Откладывай новые книги кнопкой «📥 На полку» под рекомендациями.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
     else:
-        bot.answer_callback_query(call.id, "Полка уже пуста.")
+        bot.answer_callback_query(call.id, "Уже пусто.")
     bot.send_message(
         call.message.chat.id,
         "Чем займёмся дальше? 👇",
@@ -592,15 +713,64 @@ def on_shelf_clear_confirm(call):
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "shelf_clear_cancel")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_cancel_"))
 def on_shelf_clear_cancel(call):
-    """Отмена очистки полки."""
+    """Отмена очистки полки или прочитанного."""
     bot.answer_callback_query(call.id, "Оставили как есть.")
     bot.edit_message_text(
-        "Хорошо, оставили полку как есть. 📚",
+        "Хорошо, оставили как есть. 📚",
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_toggle_"))
+def on_shelf_toggle(call):
+    """Смена статуса книги: saved <-> read."""
+    try:
+        book_id = int(call.data.split("_")[-1])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        return
+
+    new_status = toggle_book_status(call.message.chat.id, book_id)
+    if not new_status:
+        bot.answer_callback_query(call.id, "Книга не найдена.")
+        return
+
+    # Обновляем сообщение с новыми кнопками
+    status = "saved" if new_status == "read" else "read"
+    show_shelf(call.message.chat.id, status=status)
+    bot.answer_callback_query(call.id, "Статус обновлён.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_delete_"))
+def on_shelf_delete(call):
+    """Удаление книги из полки."""
+    try:
+        book_id = int(call.data.split("_")[-1])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        return
+
+    # Определяем статус книги перед удалением, чтобы обновить правильный список
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
+            (book_id, str(call.message.chat.id)),
+        )
+        row = cur.fetchone()
+        status = row["status"] if row else "saved"
+    finally:
+        conn.close()
+
+    removed = remove_from_shelf(call.message.chat.id, book_id)
+    if removed:
+        bot.answer_callback_query(call.id, "🗑 Книга удалена.")
+        show_shelf(call.message.chat.id, status=status)
+    else:
+        bot.answer_callback_query(call.id, "Книга не найдена.")
 
 
 # --- Flask-приложение для Webhooks ---
@@ -618,14 +788,18 @@ def webhook():
         return 'Invalid content type', 400
 
     json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
+    try:
+        update = telebot.types.Update.de_json(json_string)
+    except Exception:
+        traceback.print_exc()
+        logger.error("Не удалось распарсить обновление от Telegram", exc_info=True)
+        return 'OK', 200
+
     try:
         bot.process_new_updates([update])
-    except Exception as e:
-        # Логируем внутреннюю ошибку (например, сбой API ЛитРес), но всегда
-        # возвращаем Telegram статус 200, чтобы он не повторял запросы и не
-        # спамил нас 429 Too Many Requests.
-        logger.error("Ошибка при обработке обновления в webhook: %s", e)
+    except Exception:
+        traceback.print_exc()
+        logger.error("Ошибка при обработке обновления в webhook", exc_info=True)
     return 'OK', 200
 
 
@@ -641,6 +815,7 @@ def index():
 
 
 if __name__ == "__main__":
+    init_db()
     print(welcome_text)
     print("Бот «Книжный сомелье» запущен в режиме Webhooks...")
     app.run(host='0.0.0.0', port=PORT)
