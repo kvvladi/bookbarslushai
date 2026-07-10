@@ -137,7 +137,12 @@ def get_litres_random_book(category: str) -> dict | None:
         inst = item.get("instance") or {}
         rating_obj = inst.get("rating") or {}
         rating = rating_obj.get("rated_avg")
-        return rating is not None and rating >= 3.5
+        if rating is None:
+            return False
+        try:
+            return float(rating) >= 3.5
+        except (TypeError, ValueError):
+            return False
 
     items = [item for item in items if _has_valid_rating(item)]
     if not items:
@@ -210,8 +215,12 @@ def _build_litres_caption(book: dict) -> str:
     book_url = book.get("book_url") or book.get("Ссылка") or ""
 
     # Рейтинг в формате «⭐ 4.5» (одна звезда-маркер + числовое значение).
-    if rating is not None and rating > 0:
-        rating_line = f"Рейтинг: ⭐ {rating}"
+    try:
+        rating_val = float(rating) if rating is not None else None
+    except (TypeError, ValueError):
+        rating_val = None
+    if rating_val is not None and rating_val > 0:
+        rating_line = f"Рейтинг: ⭐ {rating_val}"
     else:
         rating_line = "Рейтинг: пока нет оценок"
 
@@ -264,7 +273,7 @@ def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
             parse_mode="HTML",
             reply_markup=shelf_kb,
         )
-    except telebot.apihelper.ApiException:
+    except telebot.apihelper.ApiTelegramException:
         intro = random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
         return _send_book_text(chat_id, book, intro, shelf_kb)
 
@@ -570,7 +579,8 @@ def get_book_from_json(category: str) -> dict | None:
     Возвращает словарь в нашей схеме (Название, Автор, Описание, Послевкусие)
     или None, если для категории нет книг в подборке.
     """
-    books = _load_curated().get(category)
+    books_db = _load_curated()
+    books = books_db.get(category, books_db.get("Лёгкость и смех"))
     if not books:
         return None
     b = random.choice(books)
@@ -614,6 +624,10 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
             cover = inst["cover_url"]
             url = inst.get("url")
             rating = (inst.get("rating") or {}).get("rated_avg")
+            try:
+                rating = float(rating) if rating is not None else None
+            except (TypeError, ValueError):
+                rating = None
             break
     if not cover:
         return None
@@ -631,8 +645,12 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
     link = book.get("Ссылка")
     link_line = f"\n\n🔗 <a href=\"{link}\">Читать на ЛитРес</a>" if link else ""
     rating = book.get("rating")
-    if rating is not None and rating > 0:
-        rating_line = f"Рейтинг: ⭐ {rating}"
+    try:
+        rating_val = float(rating) if rating is not None else None
+    except (TypeError, ValueError):
+        rating_val = None
+    if rating_val is not None and rating_val > 0:
+        rating_line = f"Рейтинг: ⭐ {rating_val}"
     else:
         rating_line = "Рейтинг: пока нет оценок"
     annotation = (book.get("Описание") or "").strip()
@@ -920,7 +938,7 @@ def webhook():
     """
     try:
         if request.headers.get('content-type') != 'application/json':
-            return 'Invalid content type', 400
+            return 'OK', 200
 
         json_string = request.get_data().decode('utf-8')
         try:
