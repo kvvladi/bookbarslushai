@@ -1173,28 +1173,25 @@ app = Flask(__name__)
 @app.route('/', methods=['POST'])
 def webhook():
     try:
+        # ВСЁ чтение запросов, проверка JSON и запуск потоков
+        # должно быть строго внутри этого try!
         if request.headers.get('content-type') == 'application/json':
             json_string = request.get_data().decode('utf-8')
             update = telebot.types.Update.de_json(json_string)
-            
-            # Запускаем обработку апдейта в фоновом потоке
             thread = threading.Thread(target=safe_process_update, args=(update,))
             thread.start()
-            
-            # Мгновенно отвечаем Телеграму, что всё хорошо
-            return "OK", 200
-        else:
-            return "Unsupported Media Type", 415
-    except Exception as e:
+        return "OK", 200
+    except BaseException as e: # Ловим вообще ВСЁ, включая системные выходы
         import traceback
+        print("CRITICAL WEBHOOK ERROR:")
         traceback.print_exc()
-        return "OK", 200 # Даже при фатальной ошибке парсинга отдаем 200
+        return "OK", 200 # Сервер не имеет права отвечать 500
 
 def safe_process_update(update):
     """Фоновая функция для безопасной обработки обновлений"""
     try:
         bot.process_new_updates([update])
-    except Exception:
+    except BaseException:
         logger.error("Ошибка при обработке обновления", exc_info=True)
 
 
