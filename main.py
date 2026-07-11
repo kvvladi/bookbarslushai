@@ -6,6 +6,7 @@ import random
 import logging
 import sqlite3
 import traceback
+import time
 import hashlib
 import requests
 from functools import lru_cache
@@ -13,6 +14,7 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 from flask import Flask, request
+import threading
 
 load_dotenv()
 
@@ -24,6 +26,19 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 
 logger = telebot.logger
 telebot.logger.setLevel(logging.DEBUG)
+
+
+def _tg_call(func, *args, **kwargs):
+    """Выполняет вызов Telegram API с защитой от 429 Too Many Requests."""
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except telebot.apihelper.ApiTelegramException as e:
+            if getattr(e, 'error_code', None) == 429:
+                logger.warning("Получен 429 от Telegram, ожидаем 2 секунды...")
+                time.sleep(2)
+                continue
+            raise
 
 # --- Интеграция с открытым поисковым API ЛитРес ---
 # Публичный эндпоинт поиска. Для книг обязателен параметр types
@@ -317,7 +332,7 @@ def _send_litres_card(chat_id: int, book: dict, shelf_kb) -> "types.Message":
     При неудаче с фото откатывается на текстовое сообщение."""
     caption = _build_litres_caption(book)
     try:
-        return bot.send_photo(
+        return _tg_call(bot.send_photo,
             chat_id,
             photo=book["cover_url"],
             caption=caption,
@@ -472,14 +487,14 @@ def show_shelf(chat_id: int, status: str = "saved") -> None:
     except ShelfDBError:
         # Сбой БД не должен ронять бота и провоцировать петлю 429:
         # просто сообщаем пользователю и завершаем.
-        bot.send_message(
+        _tg_call(bot.send_message,
             chat_id,
             "Упс, полка временно недоступна 🛠 Попробуй чуть позже — мы уже чиним погреб.",
             reply_markup=get_main_keyboard(),
         )
         return
     if not books:
-        bot.send_message(
+        _tg_call(bot.send_message,
             chat_id,
             "Здесь пока пусто. Самое время найти хорошую книгу! 🍷",
             reply_markup=get_main_keyboard(),
@@ -517,7 +532,7 @@ def show_shelf(chat_id: int, status: str = "saved") -> None:
     clear_label = "🧹 Очистить полку" if status == "saved" else "🧹 Очистить прочитанное"
     kb.row(types.InlineKeyboardButton(clear_label, callback_data=clear_callback))
 
-    bot.send_message(
+    _tg_call(bot.send_message,
         chat_id,
         f"{status_label}\n\n" + "\n".join(lines),
         parse_mode="HTML",
@@ -607,7 +622,7 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
 
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
+    _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
 
 @bot.message_handler(func=lambda message: True)
@@ -626,7 +641,7 @@ def handle_main_menu(message):
 
     # Открытие меню выбора настроения
     if text == "🎭 Выбрать настроение":
-        bot.send_message(
+        _tg_call(bot.send_message,
             message.chat.id,
             "🎭 <b>Выбери настроение:</b>",
             parse_mode="HTML",
@@ -635,7 +650,7 @@ def handle_main_menu(message):
         return
 
     # Если пользователь нажал что-то другое — подсказываем меню
-    bot.send_message(
+    _tg_call(bot.send_message,
         message.chat.id,
         "Пожалуйста, выбери действие из меню ниже 👇",
         reply_markup=get_main_keyboard(),
@@ -770,7 +785,7 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
         f"\n\n🥂 <b>Послевкусие</b>\n\n{intro_text}"
         f"{link_line}"
     )
-    return bot.send_message(chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
+    return _tg_call(bot.send_message, chat_id, response, parse_mode="HTML", reply_markup=shelf_kb)
 
 
 def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = None) -> None:
@@ -797,7 +812,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
     # 2) Fallback: случайная книга из нашей подборки books.json.
     book = get_book_from_json(category, exclude_hash=exclude_hash)
     if not book:
-        bot.send_message(
+        _tg_call(bot.send_message,
             chat_id,
             "😔 В этой подборке пока пусто. Загляни в другой погреб — "
             "выбери настроение на кнопках ниже 👇",
@@ -836,12 +851,12 @@ def on_mood_selected(call):
     category = call.data[len("mood_"):]
     # Мгновенная обратная связь: показываем, что бот начал работу, и
     # предотвращаем повторные клики, пока идёт (возможно кэшированный) поиск.
-    bot.send_chat_action(call.message.chat.id, 'upload_photo')
+    _tg_call(bot.send_chat_action, call.message.chat.id, 'upload_photo')
     # Сохраняем текущее настроение, чтобы кнопка «Следующая книга»
     # могла заново запустить поиск в той же категории.
     user_current_category[call.message.chat.id] = category
     send_recommendation(call.message.chat.id, category)
-    bot.answer_callback_query(call.id)
+    _tg_call(bot.answer_callback_query, call.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "next_book")
@@ -859,15 +874,15 @@ def on_next_book(call):
         chat_id = call.message.chat.id
         # Мгновенная обратная связь ДО начала поиска: показываем, что бот
         # работает, и предотвращаем повторные клики «Следующая книга».
-        bot.send_chat_action(chat_id, 'upload_photo')
+        _tg_call(bot.send_chat_action, chat_id, 'upload_photo')
         # Безопасное извлечение категории: при перезагрузке сервера
         # словарь в памяти пуст, .get() вернёт None вместо KeyError.
         category = user_current_category.get(chat_id)
         if not category:
             # Пользователь ещё не выбирал настроение в этой сессии
             # (или бот перезагрузился) — просим выбрать заново.
-            bot.answer_callback_query(call.id, "Сначала выбери настроение 🎭")
-            bot.send_message(
+            _tg_call(bot.answer_callback_query, call.id, "Сначала выбери настроение 🎭")
+            _tg_call(bot.send_message,
                 chat_id,
                 "Выберите настроение заново в главном меню 👇",
                 reply_markup=get_mood_inline_keyboard(),
@@ -881,14 +896,14 @@ def on_next_book(call):
         exclude_hash = _book_hash(last_book) if last_book else None
 
         send_recommendation(chat_id, category, exclude_hash=exclude_hash)
-        bot.answer_callback_query(call.id)
+        _tg_call(bot.answer_callback_query, call.id)
     except Exception:
         # Любая непредвиденная ошибка (таймаут ЛитРес, 429 и т.д.) не
         # должна ронять обработчик — логируем и спокойно завершаем.
         traceback.print_exc()
         logger.error("Ошибка в обработчике on_next_book", exc_info=True)
         try:
-            bot.answer_callback_query(call.id)
+            _tg_call(bot.answer_callback_query, call.id)
         except Exception:
             pass
 
@@ -898,30 +913,30 @@ def on_shelf_add(call):
     """Обработка кнопок «На полку» и «Уже читал» под рекомендацией."""
     parts = call.data.split("_", 3)
     if len(parts) != 4:
-        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        _tg_call(bot.answer_callback_query, call.id, "Некорректные данные кнопки.")
         return
     status = parts[2]  # saved или read
     expected_hash = parts[3]
 
     pending = pending_book.get(call.message.message_id)
     if not pending:
-        bot.answer_callback_query(call.id, "Книга уже недоступна для добавления.")
+        _tg_call(bot.answer_callback_query, call.id, "Книга уже недоступна для добавления.")
         return
     if pending.get("hash") != expected_hash:
-        bot.answer_callback_query(call.id, "Книга уже недоступна для добавления.")
+        _tg_call(bot.answer_callback_query, call.id, "Книга уже недоступна для добавления.")
         return
 
     book = pending["book"]
     try:
         added = add_to_shelf(call.message.chat.id, book, status=status)
     except ShelfDBError:
-        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if added:
         status_label = "📥 Добавлено на полку!" if status == "saved" else "✅ Отмечено как прочитанное!"
-        bot.answer_callback_query(call.id, status_label)
+        _tg_call(bot.answer_callback_query, call.id, status_label)
     else:
-        bot.answer_callback_query(call.id, "Эта книга уже есть у тебя.")
+        _tg_call(bot.answer_callback_query, call.id, "Эта книга уже есть у тебя.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_"))
@@ -929,7 +944,7 @@ def on_shelf_clear(call):
     """Обработка inline-кнопки «Очистить полку» / «Очистить прочитанное»."""
     status = call.data[len("shelf_clear_"):]
     if status not in ("saved", "read"):
-        bot.answer_callback_query(call.id, "Некорректный статус.")
+        _tg_call(bot.answer_callback_query, call.id, "Некорректный статус.")
         return
 
     status_label = "полка" if status == "saved" else "список прочитанного"
@@ -939,7 +954,7 @@ def on_shelf_clear(call):
         types.InlineKeyboardButton("❌ Нет, оставить", callback_data=f"shelf_clear_cancel_{status}"),
     )
     try:
-        bot.edit_message_reply_markup(
+        _tg_call(bot.edit_message_reply_markup,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=confirm_kb,
@@ -949,7 +964,7 @@ def on_shelf_clear(call):
         # а всего лишь уведомление, что клавиатура уже такая же.
         if "message is not modified" not in str(e):
             logger.warning("Не удалось обновить клавиатуру: %s", e)
-    bot.answer_callback_query(call.id)
+    _tg_call(bot.answer_callback_query, call.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_confirm_"))
@@ -957,19 +972,19 @@ def on_shelf_clear_confirm(call):
     """Подтверждение очистки полки или прочитанного."""
     status = call.data[len("shelf_clear_confirm_"):]
     if status not in ("saved", "read"):
-        bot.answer_callback_query(call.id, "Некорректный статус.")
+        _tg_call(bot.answer_callback_query, call.id, "Некорректный статус.")
         return
 
     try:
         cleared = clear_shelf(call.message.chat.id, status=status)
     except ShelfDBError:
-        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if cleared:
         status_text = "🧹 Полка очищена." if status == "saved" else "🧹 Список прочитанного очищен."
-        bot.answer_callback_query(call.id, status_text)
+        _tg_call(bot.answer_callback_query, call.id, status_text)
         try:
-            bot.edit_message_text(
+            _tg_call(bot.edit_message_text,
                 f"{status_text} Откладывай новые книги кнопкой «📥 На полку» под рекомендациями.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
@@ -978,8 +993,8 @@ def on_shelf_clear_confirm(call):
             if "message is not modified" not in str(e):
                 logger.warning("Не удалось отредактировать сообщение: %s", e)
     else:
-        bot.answer_callback_query(call.id, "Уже пусто.")
-    bot.send_message(
+        _tg_call(bot.answer_callback_query, call.id, "Уже пусто.")
+    _tg_call(bot.send_message,
         call.message.chat.id,
         "Чем займёмся дальше? 👇",
         reply_markup=get_main_keyboard(),
@@ -989,9 +1004,9 @@ def on_shelf_clear_confirm(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_clear_cancel_"))
 def on_shelf_clear_cancel(call):
     """Отмена очистки полки или прочитанного."""
-    bot.answer_callback_query(call.id, "Оставили как есть.")
+    _tg_call(bot.answer_callback_query, call.id, "Оставили как есть.")
     try:
-        bot.edit_message_text(
+        _tg_call(bot.edit_message_text,
             "Хорошо, оставили как есть. 📚",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
@@ -1007,22 +1022,22 @@ def on_shelf_toggle(call):
     try:
         book_id = int(call.data.split("_")[-1])
     except (ValueError, IndexError):
-        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        _tg_call(bot.answer_callback_query, call.id, "Некорректные данные кнопки.")
         return
 
     try:
         new_status = toggle_book_status(call.message.chat.id, book_id)
     except ShelfDBError:
-        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if not new_status:
-        bot.answer_callback_query(call.id, "Книга не найдена.")
+        _tg_call(bot.answer_callback_query, call.id, "Книга не найдена.")
         return
 
     # Обновляем сообщение с новыми кнопками
     status = "saved" if new_status == "read" else "read"
     show_shelf(call.message.chat.id, status=status)
-    bot.answer_callback_query(call.id, "Статус обновлён.")
+    _tg_call(bot.answer_callback_query, call.id, "Статус обновлён.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_delete_"))
@@ -1031,7 +1046,7 @@ def on_shelf_delete(call):
     try:
         book_id = int(call.data.split("_")[-1])
     except (ValueError, IndexError):
-        bot.answer_callback_query(call.id, "Некорректные данные кнопки.")
+        _tg_call(bot.answer_callback_query, call.id, "Некорректные данные кнопки.")
         return
 
     # Определяем статус книги перед удалением, чтобы обновить правильный список
@@ -1049,14 +1064,14 @@ def on_shelf_delete(call):
 
         removed = remove_from_shelf(call.message.chat.id, book_id)
     except ShelfDBError:
-        bot.answer_callback_query(call.id, "Упс, полка временно недоступна")
+        _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
 
     if removed:
-        bot.answer_callback_query(call.id, "🗑 Книга удалена.")
+        _tg_call(bot.answer_callback_query, call.id, "🗑 Книга удалена.")
         show_shelf(call.message.chat.id, status=status)
     else:
-        bot.answer_callback_query(call.id, "Книга не найдена.")
+        _tg_call(bot.answer_callback_query, call.id, "Книга не найдена.")
 
 
 # --- Flask-приложение для Webhooks ---
@@ -1070,14 +1085,30 @@ app = Flask(__name__)
 @app.route('/', methods=['POST'])
 def webhook():
     try:
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
+        if request.headers.get('content-type') == 'application/json':
+            json_string = request.get_data().decode('utf-8')
+            update = telebot.types.Update.de_json(json_string)
+            
+            # Запускаем обработку апдейта в фоновом потоке
+            thread = threading.Thread(target=safe_process_update, args=(update,))
+            thread.start()
+            
+            # Мгновенно отвечаем Телеграму, что всё хорошо
+            return "OK", 200
+        else:
+            return "Unsupported Media Type", 415
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return "OK", 200 # Даже при фатальной ошибке парсинга отдаем 200
+
+def safe_process_update(update):
+    """Фоновая функция для безопасной обработки обновлений"""
+    try:
         bot.process_new_updates([update])
     except Exception as e:
         import traceback
         traceback.print_exc()
-    finally:
-        return "OK", 200
 
 
 @app.route('/')
