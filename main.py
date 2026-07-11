@@ -85,8 +85,10 @@ def safe_answer_callback_query(call, text: str = "") -> None:
     """
     try:
         bot.answer_callback_query(call.id, text=text)
-    except Exception:
-        logger.warning("Не удалось ответить на callback_query %s", call.id)
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error("Не удалось ответить на callback_query %s: %s", call.id, e)
+    except Exception as e:
+        logger.error("Не удалось ответить на callback_query %s: %s", call.id, e, exc_info=True)
 
 
 # --- Интеграция с открытым поисковым API ЛитРес ---
@@ -709,39 +711,44 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
 
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=get_main_keyboard())
+    try:
+        _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=get_main_keyboard())
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error("Не удалось отправить приветствие: %s", e)
 
 
 @bot.message_handler(func=lambda message: True)
 def handle_main_menu(message):
     text = message.text.strip()
+    try:
+        # Просмотр полки отложенных книг
+        if text == "📚 Моя полка":
+            show_shelf(message.chat.id, status="saved")
+            return
 
-    # Просмотр полки отложенных книг
-    if text == "📚 Моя полка":
-        show_shelf(message.chat.id, status="saved")
-        return
+        # Просмотр прочитанных книг
+        if text == "✅ Прочитанное":
+            show_shelf(message.chat.id, status="read")
+            return
 
-    # Просмотр прочитанных книг
-    if text == "✅ Прочитанное":
-        show_shelf(message.chat.id, status="read")
-        return
+        # Открытие меню выбора настроения
+        if text == "🎭 Выбрать настроение":
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "🎭 <b>Выбери настроение:</b>",
+                parse_mode="HTML",
+                reply_markup=get_mood_inline_keyboard(),
+            )
+            return
 
-    # Открытие меню выбора настроения
-    if text == "🎭 Выбрать настроение":
+        # Если пользователь нажал что-то другое — подсказываем меню
         _tg_call(bot.send_message,
             message.chat.id,
-            "🎭 <b>Выбери настроение:</b>",
-            parse_mode="HTML",
-            reply_markup=get_mood_inline_keyboard(),
+            "Пожалуйста, выбери действие из меню ниже 👇",
+            reply_markup=get_main_keyboard(),
         )
-        return
-
-    # Если пользователь нажал что-то другое — подсказываем меню
-    _tg_call(bot.send_message,
-        message.chat.id,
-        "Пожалуйста, выбери действие из меню ниже 👇",
-        reply_markup=get_main_keyboard(),
-    )
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error("Ошибка в обработчике handle_main_menu: %s", e)
 
 
 # --- Кураторская подборка books.json (локальный fallback) ---
@@ -1187,9 +1194,8 @@ def safe_process_update(update):
     """Фоновая функция для безопасной обработки обновлений"""
     try:
         bot.process_new_updates([update])
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.error("Ошибка при обработке обновления", exc_info=True)
 
 
 @app.route('/')
