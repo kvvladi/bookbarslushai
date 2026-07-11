@@ -63,9 +63,16 @@ class ShelfDBError(Exception):
     pass
 
 def init_db() -> None:
-    """Создаёт таблицу полки пользователей, если она не существует."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    try:
+    """Создаёт таблицу полки пользователей, если она не существует.
+
+    Вызывается один раз при старте приложения (до обработки запросов).
+    Подключение открывается локально и закрывается контекстным
+    менеджером. timeout=10 защищает от 'database is locked' при
+    конкурентных потоках, а WAL-журнал позволяет читателям и писателю
+    работать параллельно, снижая блокировки под нагрузкой.
+    """
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS shelves (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,19 +88,6 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_shelves_chat_status
             ON shelves (chat_id, status)
         """)
-        conn.commit()
-    finally:
-        conn.close()
-
-def get_db() -> sqlite3.Connection:
-    """Возвращает подключение к БД с разрешённым доступом из разных потоков."""
-    try:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except sqlite3.Error as e:
-        logger.error("Не удалось подключиться к БД: %s", e)
-        raise ShelfDBError() from e
 
 
 # --- Маппинг эмоциональных категорий на поисковые запросы ЛитРес ---
@@ -366,8 +360,12 @@ def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
     """Добавляет книгу на полку пользователя с указанным статусом.
     Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
     try:
-        conn = get_db()
-        try:
+        # Локальное подключение внутри функции: каждый поток открывает и
+        # закрывает своё соединение. timeout=10 — поток ждёт в очереди,
+        # если база занята другим писателем, вместо мгновенного
+        # 'database is locked'. commit() выполняется автоматически при
+        # выходе из `with` (без исключений).
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
             cur = conn.execute(
                 "SELECT id FROM shelves WHERE chat_id = ? AND title = ?",
                 (str(chat_id), book.get("Название", "")),
@@ -384,12 +382,10 @@ def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
                     status,
                 ),
             )
-            conn.commit()
             return True
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.error("Ошибка БД (add_to_shelf): %s", e)
+        traceback.print_exc()
         raise ShelfDBError() from e
 
 
@@ -397,26 +393,23 @@ def remove_from_shelf(chat_id: int, book_id: int) -> bool:
     """Убирает книгу с полки пользователя по ID записи.
     Возвращает True, если книга была найдена и удалена."""
     try:
-        conn = get_db()
-        try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
             cur = conn.execute(
                 "DELETE FROM shelves WHERE id = ? AND chat_id = ?",
                 (book_id, str(chat_id)),
             )
-            conn.commit()
             return cur.rowcount > 0
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.error("Ошибка БД (remove_from_shelf): %s", e)
+        traceback.print_exc()
         raise ShelfDBError() from e
 
 
 def toggle_book_status(chat_id: int, book_id: int) -> str | None:
     """Меняет статус книги: saved <-> read. Возвращает новый статус или None."""
     try:
-        conn = get_db()
-        try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
                 (book_id, str(chat_id)),
@@ -429,12 +422,10 @@ def toggle_book_status(chat_id: int, book_id: int) -> str | None:
                 "UPDATE shelves SET status = ? WHERE id = ?",
                 (new_status, book_id),
             )
-            conn.commit()
             return new_status
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.error("Ошибка БД (toggle_book_status): %s", e)
+        traceback.print_exc()
         raise ShelfDBError() from e
 
 
@@ -442,8 +433,7 @@ def clear_shelf(chat_id: int, status: str | None = None) -> bool:
     """Очищает полку пользователя (все статусы или только указанный).
     Возвращает True, если что-то было удалено."""
     try:
-        conn = get_db()
-        try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
             if status:
                 cur = conn.execute(
                     "DELETE FROM shelves WHERE chat_id = ? AND status = ?",
@@ -454,29 +444,26 @@ def clear_shelf(chat_id: int, status: str | None = None) -> bool:
                     "DELETE FROM shelves WHERE chat_id = ?",
                     (str(chat_id),),
                 )
-            conn.commit()
             return cur.rowcount > 0
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.error("Ошибка БД (clear_shelf): %s", e)
+        traceback.print_exc()
         raise ShelfDBError() from e
 
 
 def get_user_books(chat_id: int, status: str) -> list[dict]:
     """Возвращает список книг пользователя с указанным статусом."""
     try:
-        conn = get_db()
-        try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 "SELECT id, title, author, link, status FROM shelves WHERE chat_id = ? AND status = ? ORDER BY created_at DESC",
                 (str(chat_id), status),
             )
             return [dict(row) for row in cur.fetchall()]
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.error("Ошибка БД (get_user_books): %s", e)
+        traceback.print_exc()
         raise ShelfDBError() from e
 
 
@@ -487,6 +474,9 @@ def show_shelf(chat_id: int, status: str = "saved") -> None:
     except ShelfDBError:
         # Сбой БД не должен ронять бота и провоцировать петлю 429:
         # просто сообщаем пользователю и завершаем.
+        # Выводим полный стек в консоль/Render-логи, чтобы видеть
+        # точную причину (database is locked, no such table и т.п.).
+        traceback.print_exc()
         _tg_call(bot.send_message,
             chat_id,
             "Упс, полка временно недоступна 🛠 Попробуй чуть позже — мы уже чиним погреб.",
@@ -930,6 +920,8 @@ def on_shelf_add(call):
     try:
         added = add_to_shelf(call.message.chat.id, book, status=status)
     except ShelfDBError:
+        # Полный стек ошибки — в консоль/Render-логи, чтобы видеть причину.
+        traceback.print_exc()
         _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if added:
@@ -978,6 +970,7 @@ def on_shelf_clear_confirm(call):
     try:
         cleared = clear_shelf(call.message.chat.id, status=status)
     except ShelfDBError:
+        traceback.print_exc()
         _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if cleared:
@@ -1028,6 +1021,7 @@ def on_shelf_toggle(call):
     try:
         new_status = toggle_book_status(call.message.chat.id, book_id)
     except ShelfDBError:
+        traceback.print_exc()
         _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
     if not new_status:
@@ -1051,19 +1045,18 @@ def on_shelf_delete(call):
 
     # Определяем статус книги перед удалением, чтобы обновить правильный список
     try:
-        conn = get_db()
-        try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
                 (book_id, str(call.message.chat.id)),
             )
             row = cur.fetchone()
             status = row["status"] if row else "saved"
-        finally:
-            conn.close()
 
         removed = remove_from_shelf(call.message.chat.id, book_id)
     except ShelfDBError:
+        traceback.print_exc()
         _tg_call(bot.answer_callback_query, call.id, "Упс, полка временно недоступна")
         return
 
@@ -1120,6 +1113,13 @@ def index():
         return f'Webhook установлен: {APP_URL}', 200
     else:
         return 'Не удалось установить webhook', 500
+
+
+# Гарантируем создание таблиц при импорте модуля. Под gunicorn
+# (Procfile: `gunicorn main:app`) блок `if __name__ == "__main__"` НЕ
+# выполняется, поэтому вызов здесь — единственный надёжный способ
+# инициализировать БД ДО того, как пользователи начнут жать кнопки полки.
+init_db()
 
 
 if __name__ == "__main__":
