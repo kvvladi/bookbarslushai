@@ -521,15 +521,17 @@ def debounce_lock(func):
 
     Захватывает per-user блокировку через существующий thread-safe механизм
     _acquire_user_lock/_release_user_lock. Если пользователь уже обрабатывает
-    предыдущий клик — мгновенно отвечает на callback и игнорирует новый,
-    предотвращая спам и 429 Too Many Requests.
+    предыдущий клик — МОЛЧА игнорирует новый (без какого-либо ответа на
+    callback). Это критично: отправка answer_callback_query на каждый
+    спам-клик порождает шквал запросов к Telegram и приводит к бану 429
+    Too Many Requests. Легитимные (не заблокированные) клики отвечаются
+    внутри самих обработчиков через safe_answer_callback_query.
     """
     @wraps(func)
     def wrapper(call, *args, **kwargs):
         user_id = call.from_user.id
         if not _acquire_user_lock(user_id):
-            safe_answer_callback_query(call, "Обработка... секундочку ⏳")
-            return
+            return  # Молча игнорируем спам-клики!
         try:
             return func(call, *args, **kwargs)
         finally:
@@ -1562,15 +1564,30 @@ def safe_process_update(update):
         logger.error("Ошибка при обработке обновления", exc_info=True)
 
 
+# Флаг гарантирует, что set_webhook вызывается ровно один раз за жизнь
+# процесса. Повторная установка вебхука на каждый запрос (например, при
+# health-check'ах балансировщика) гарантированно провоцирует 429 от
+# Telegram. НИКОГДА не вызываем set_webhook внутри POST-роута webhook().
+_webhook_configured = False
+_webhook_lock = threading.Lock()
+
+
 @app.route('/')
 def index():
-    """Устанавливаем webhook при старте/деплое."""
-    bot.remove_webhook()
-    success = bot.set_webhook(url=APP_URL)
-    if success:
-        return f'Webhook установлен: {APP_URL}', 200
-    else:
-        return 'Не удалось установить webhook', 500
+    """Устанавливаем webhook ровно один раз (при первом обращении к '/')."""
+    global _webhook_configured
+    if _webhook_configured:
+        return f'Webhook уже установлен: {APP_URL}', 200
+    with _webhook_lock:
+        if _webhook_configured:
+            return f'Webhook уже установлен: {APP_URL}', 200
+        bot.remove_webhook()
+        success = bot.set_webhook(url=APP_URL)
+        if success:
+            _webhook_configured = True
+            return f'Webhook установлен: {APP_URL}', 200
+        else:
+            return 'Не удалось установить webhook', 500
 
 
 # Гарантируем создание таблиц при импорте модуля. Под gunicorn
