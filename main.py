@@ -184,7 +184,7 @@ MOOD_TO_LITRES = {
     # попадали в топ результатов (сортировка sort=popular/relevance).
     "Пища для ума": "научно-популярная литература хиты зарубежная классика русская классика мировые бестселлеры",
     "Лёгкость и смех": "юмористическая проза бестселлеры",
-    "Уйти от реальности": "фантастика фэнтези популярное",
+    "Уйти от реальности": "магический реализм эпическая фантастика мастер и маргарита дюна властелин колец",
     "Закрытый клуб": "интеллектуальный детектив классика популярное зарубежная классика русская классика мировые бестселлеры",
     "Проглотить за одну ночь": "остросюжетный детектив триллер бестселлеры",
     "Моральный детокс": "современная проза вдохновляющие бестселлеры",
@@ -314,7 +314,7 @@ def get_litres_books_list(category: str) -> tuple:
     return tuple(candidates)
 
 
-def get_litres_random_book(category: str, exclude_hash: str | None = None) -> dict | None:
+def get_litres_random_book(category: str, exclude_hash: str | None = None, chat_id: int | None = None) -> dict | None:
     """Возвращает ОДНУ случайную книгу из кэшированного списка ЛитРес.
 
     Список кандидатов берётся из get_litres_books_list (кэшируется через
@@ -326,6 +326,10 @@ def get_litres_random_book(category: str, exclude_hash: str | None = None) -> di
     эта книга исключается из пула выбора, чтобы «Следующая книга» никогда не
     выдавала ту же книгу дважды подряд. Если после исключения список пуст
     (в категории всего одна книга), откатываемся на полный список.
+
+    chat_id — идентификатор пользователя. Если передан, из выдачи исключаются
+    книги, которые пользователь уже сохранил или отметил как прочитанные
+    (анти-повтор).
 
     При пустом кэше (таймаут/ошибка/нет книг) возвращает None — вызывающий
     код уходит в fallback на локальный books.json.
@@ -339,6 +343,15 @@ def get_litres_random_book(category: str, exclude_hash: str | None = None) -> di
         # возвращаемся к полному списку (дубль лучше, чем пустота).
         if filtered:
             books = filtered
+
+    # Анти-повтор: исключаем книги, которые пользователь уже сохранил/прочитал.
+    if chat_id is not None:
+        user_titles = get_user_book_titles(chat_id, ["saved", "read"])
+        if user_titles:
+            books = [b for b in books if b.get("Название") not in user_titles]
+
+    if not books:
+        return None
     return random.choice(books)
 
 
@@ -559,6 +572,23 @@ def get_user_books(chat_id: int, status: str) -> list[dict]:
         raise ShelfDBError() from e
 
 
+def get_user_book_titles(chat_id: int, statuses: list[str]) -> set[str]:
+    """Возвращает множество названий книг пользователя с указанными статусами."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                placeholders = ",".join(["%s"] * len(statuses))
+                cur.execute(
+                    f"SELECT title FROM shelves WHERE chat_id = %s AND status IN ({placeholders})",
+                    (chat_id, *statuses),
+                )
+                return {row[0] for row in cur.fetchall()}
+    except (psycopg2.Error, ShelfDBError) as e:
+        logger.error("Ошибка БД (get_user_book_titles): %s", e)
+        traceback.print_exc()
+        return set()
+
+
 def show_shelf(chat_id: int, status: str = "saved", edit_message_id: int | None = None) -> None:
     """Отправляет или редактирует список книг пользователя с указанным статусом."""
     try:
@@ -626,19 +656,20 @@ def show_shelf(chat_id: int, status: str = "saved", edit_message_id: int | None 
         else:
             lines.append(f"{i}. {title} — {author}")
 
-    kb = types.InlineKeyboardMarkup()
-    for b in books:
-        book_id = b["id"]
-        truncated_title = _truncate_title(b.get("title", "Книга"))
-        kb.row(
-            types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
-        )
-
-    # Кнопка очистки только для сохраненных книг
+    # Inline-кнопки только для сохраненных книг; прочитанное — чистый список.
     if status == "saved":
+        kb = types.InlineKeyboardMarkup()
+        for b in books:
+            book_id = b["id"]
+            truncated_title = _truncate_title(b.get("title", "Книга"))
+            kb.row(
+                types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
+            )
         kb.row(
             types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
         )
+    else:
+        kb = None
 
     text = f"{status_label}\n\n" + "\n".join(lines)
 
@@ -782,12 +813,37 @@ def handle_main_menu(message):
             )
             return
 
-        # Если пользователь нажал что-то другое — подсказываем меню
-        _tg_call(bot.send_message,
-            message.chat.id,
-            "Пожалуйста, выбери действие из меню ниже 👇",
-            reply_markup=get_main_keyboard(),
-        )
+        # Диалоговый роутинг по ключевым словам
+        lower_text = text.lower()
+        if any(word in lower_text for word in ["привет", "здравствуйте", "ку"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Привет! Я твой книжный сомелье. Выбирай категорию в меню, и я предложу что-то интересное — от легкой прозы до глубокой классики вроде Достоевского!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        elif any(word in lower_text for word in ["спасибо", "спс", "благодарю"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Всегда пожалуйста! Приятного чтения!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        elif any(word in lower_text for word in ["пока", "до свидания", "спокойной ночи"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "До встречи! Жду тебя за новой порцией книг.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        else:
+            # Если пользователь ввёл что-то другое — подсказываем меню
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Я пока понимаю только нажатия на кнопки меню. Выбери настроение внизу, и я найду для тебя книгу!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
     except telebot.apihelper.ApiTelegramException as e:
         logger.error("Ошибка в обработчике handle_main_menu: %s", e)
 
@@ -809,11 +865,15 @@ def _load_curated() -> dict:
     return _curated_cache
 
 
-def get_book_from_json(category: str, exclude_hash: str | None = None) -> dict | None:
+def get_book_from_json(category: str, exclude_hash: str | None = None, chat_id: int | None = None) -> dict | None:
     """Случайная книга из books.json по категории (fallback-источник).
 
     exclude_hash — хэш текущей книги; если передан, книга с таким хэшем
     исключается из выбора (защита от дублей в «Следующая книга»).
+
+    chat_id — идентификатор пользователя. Если передан, из выдачи исключаются
+    книги, которые пользователь уже сохранил или отметил как прочитанные
+    (анти-повтор).
 
     Возвращает словарь в нашей схеме (Название, Автор, Описание, Послевкусие)
     или None, если для категории нет книг в подборке.
@@ -834,6 +894,15 @@ def get_book_from_json(category: str, exclude_hash: str | None = None) -> dict |
         # выдачу, откатываемся к полному списку.
         if filtered:
             books = filtered
+
+    # Анти-повтор: исключаем книги, которые пользователь уже сохранил/прочитал.
+    if chat_id is not None:
+        user_titles = get_user_book_titles(chat_id, ["saved", "read"])
+        if user_titles:
+            books = [b for b in books if b.get("title") not in user_titles]
+
+    if not books:
+        return None
     b = random.choice(books)
     return {
         "Название": b.get("title", "—"),
@@ -936,7 +1005,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
     «Следующая книга», чтобы не выдать ту же книгу повторно.
     """
     # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
-    litres_book = get_litres_random_book(category, exclude_hash=exclude_hash)
+    litres_book = get_litres_random_book(category, exclude_hash=exclude_hash, chat_id=chat_id)
     if litres_book:
         shelf_kb = get_shelf_action_kb(litres_book)
         sent = _send_litres_card(chat_id, litres_book, shelf_kb)
@@ -945,7 +1014,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         return
 
     # 2) Fallback: случайная книга из нашей подборки books.json.
-    book = get_book_from_json(category, exclude_hash=exclude_hash)
+    book = get_book_from_json(category, exclude_hash=exclude_hash, chat_id=chat_id)
     if not book:
         _tg_call(bot.send_message,
             chat_id,
