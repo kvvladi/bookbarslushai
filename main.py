@@ -728,7 +728,7 @@ def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | 
             book_id = b["id"]
             truncated_title = _truncate_title(b.get("title", "Книга"))
             kb.row(
-                types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
+                types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_{book_id}")
             )
         kb.row(
             types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
@@ -1263,7 +1263,7 @@ def on_shelf_add(call):
         _release_user_lock(user_id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("read_book:"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("read_"))
 def on_read_book(call):
     """Обработка кнопки «Отметить прочитанным» в списке полки."""
     user_id = call.from_user.id
@@ -1274,7 +1274,7 @@ def on_read_book(call):
         return
     try:
         try:
-            book_id = int(call.data.split("_")[-1])
+            book_id = int(call.data.split("_")[1])
         except (ValueError, IndexError):
             safe_answer_callback_query(call, "Некорректные данные кнопки.")
             return
@@ -1328,7 +1328,7 @@ def on_read_book(call):
                 book_id = b["id"]
                 truncated_title = _truncate_title(b.get("title", "Книга"))
                 new_kb.row(
-                    types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
+                    types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_{book_id}")
                 )
             # Добавляем кнопку очистки
             new_kb.row(
