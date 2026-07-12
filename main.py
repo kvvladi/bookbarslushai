@@ -1014,8 +1014,14 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         try:
             litres_book = get_litres_random_book(category, exclude_hash=exclude_hash, chat_id=chat_id)
         except AllBooksReadError:
-            # Все книги категории уже прочитаны — прерываем поиск,
-            # сообщение уже отправлено в get_litres_random_book.
+            # Все книги категории уже прочитаны — прерываем поиск
+            # и отправляем сообщение через _tg_call (защита от 429).
+            _tg_call(bot.send_message,
+                chat_id,
+                "Похоже, вы уже прочитали все лучшие книги в этой категории! 🏆 "
+                "Попробуйте выбрать другое настроение в меню.",
+                reply_markup=get_main_keyboard(),
+            )
             return
         if litres_book:
             shelf_kb = get_shelf_action_kb(litres_book)
@@ -1028,8 +1034,14 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         try:
             book = get_book_from_json(category, exclude_hash=exclude_hash, chat_id=chat_id)
         except AllBooksReadError:
-            # Все книги категории уже прочитаны — прерываем поиск,
-            # сообщение уже отправлено в get_book_from_json.
+            # Все книги категории уже прочитаны — прерываем поиск
+            # и отправляем сообщение через _tg_call (защита от 429).
+            _tg_call(bot.send_message,
+                chat_id,
+                "Похоже, вы уже прочитали все лучшие книги в этой категории! 🏆 "
+                "Попробуйте выбрать другое настроение в меню.",
+                reply_markup=get_main_keyboard(),
+            )
             return
         if book:
             shelf_kb = get_shelf_action_kb(book)
