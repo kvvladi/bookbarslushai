@@ -122,6 +122,16 @@ class ShelfDBError(Exception):
     pass
 
 
+class AllBooksReadError(Exception):
+    """Все книги в выбранной категории уже прочитаны/сохранены пользователем.
+
+    Используется для досрочного прерывания поиска (List Exhaustion),
+    чтобы не делать лишние запросы к API и не спамить пользователю.
+    """
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+
+
 def get_db_connection():
     """Возвращает новое подключение к PostgreSQL по DATABASE_URL.
 
@@ -333,8 +343,13 @@ def get_litres_random_book(category: str, exclude_hash: str | None = None, chat_
 
     При пустом кэше (таймаут/ошибка/нет книг) возвращает None — вызывающий
     код уходит в fallback на локальный books.json.
+
+    При пустом списке после фильтрации прочитанных книг поднимает
+    AllBooksReadError — вызывающий код должен прервать поиск и сообщить
+    пользователю, что в категории больше нет непрочитанных книг.
     """
     books = get_litres_books_list(category)
+    original_books = books
     if not books:
         return None
     if exclude_hash:
@@ -351,6 +366,11 @@ def get_litres_random_book(category: str, exclude_hash: str | None = None, chat_
             books = [b for b in books if b.get("Название") not in user_titles]
 
     if not books:
+        # Защита от List Exhaustion: все книги категории уже прочитаны/сохранены.
+        # Поднимаем исключение, чтобы вызывающий код прервал поиск
+        # и не попытался сделать лишний запрос к fallback-источнику.
+        if original_books:
+            raise AllBooksReadError(chat_id)
         return None
     return random.choice(books)
 
@@ -789,7 +809,11 @@ def send_welcome(message):
         logger.error("Не удалось отправить приветствие: %s", e)
 
 
-@bot.message_handler(func=lambda message: True)
+@bot.message_handler(func=lambda message: message.text in [
+    "📚 Моя полка",
+    "✅ Прочитанное",
+    "🎭 Выбрать настроение",
+])
 def handle_main_menu(message):
     text = message.text.strip()
     try:
@@ -810,38 +834,6 @@ def handle_main_menu(message):
                 "🎭 <b>Выбери настроение:</b>",
                 parse_mode="HTML",
                 reply_markup=get_mood_inline_keyboard(),
-            )
-            return
-
-        # Диалоговый роутинг по ключевым словам
-        lower_text = text.lower()
-        if any(word in lower_text for word in ["привет", "здравствуйте", "ку"]):
-            _tg_call(bot.send_message,
-                message.chat.id,
-                "Привет! Я твой книжный сомелье. Выбирай категорию в меню, и я предложу что-то интересное — от легкой прозы до глубокой классики вроде Достоевского!",
-                reply_markup=get_main_keyboard(),
-            )
-            return
-        elif any(word in lower_text for word in ["спасибо", "спс", "благодарю"]):
-            _tg_call(bot.send_message,
-                message.chat.id,
-                "Всегда пожалуйста! Приятного чтения!",
-                reply_markup=get_main_keyboard(),
-            )
-            return
-        elif any(word in lower_text for word in ["пока", "до свидания", "спокойной ночи"]):
-            _tg_call(bot.send_message,
-                message.chat.id,
-                "До встречи! Жду тебя за новой порцией книг.",
-                reply_markup=get_main_keyboard(),
-            )
-            return
-        else:
-            # Если пользователь ввёл что-то другое — подсказываем меню
-            _tg_call(bot.send_message,
-                message.chat.id,
-                "Я пока понимаю только нажатия на кнопки меню. Выбери настроение внизу, и я найду для тебя книгу!",
-                reply_markup=get_main_keyboard(),
             )
             return
     except telebot.apihelper.ApiTelegramException as e:
@@ -877,9 +869,13 @@ def get_book_from_json(category: str, exclude_hash: str | None = None, chat_id: 
 
     Возвращает словарь в нашей схеме (Название, Автор, Описание, Послевкусие)
     или None, если для категории нет книг в подборке.
+
+    При пустом списке после фильтрации прочитанных книг поднимает
+    AllBooksReadError — вызывающий код должен прервать поиск.
     """
     books_db = _load_curated()
     books = books_db.get(category, books_db.get("Лёгкость и смех"))
+    original_books = books
     if not books:
         return None
     if exclude_hash:
@@ -902,6 +898,9 @@ def get_book_from_json(category: str, exclude_hash: str | None = None, chat_id: 
             books = [b for b in books if b.get("title") not in user_titles]
 
     if not books:
+        # Защита от List Exhaustion: все книги категории уже прочитаны/сохранены.
+        if original_books:
+            raise AllBooksReadError(chat_id)
         return None
     b = random.choice(books)
     return {
@@ -1003,46 +1002,64 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
 
     exclude_hash — хэш текущей книги; передаётся из callback_data кнопки
     «Следующая книга», чтобы не выдать ту же книгу повторно.
+
+    Жёсткий лимит 3 попыток: если за 3 попытки не удалось найти
+    непрочитанную книгу (в т.ч. из-за List Exhaustion), прерываем
+    поиск и сообщаем пользователю, чтобы не спамить API и не уходить
+    в бесконечный цикл.
     """
-    # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
-    litres_book = get_litres_random_book(category, exclude_hash=exclude_hash, chat_id=chat_id)
-    if litres_book:
-        shelf_kb = get_shelf_action_kb(litres_book)
-        sent = _send_litres_card(chat_id, litres_book, shelf_kb)
-        pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
-        user_last_book[chat_id] = litres_book
-        return
+    # Лимит попыток поиска: максимум 3 попытки найти непрочитанную книгу.
+    for _ in range(3):
+        # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
+        try:
+            litres_book = get_litres_random_book(category, exclude_hash=exclude_hash, chat_id=chat_id)
+        except AllBooksReadError:
+            # Все книги категории уже прочитаны — прерываем поиск,
+            # сообщение уже отправлено в get_litres_random_book.
+            return
+        if litres_book:
+            shelf_kb = get_shelf_action_kb(litres_book)
+            sent = _send_litres_card(chat_id, litres_book, shelf_kb)
+            pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
+            user_last_book[chat_id] = litres_book
+            return
 
-    # 2) Fallback: случайная книга из нашей подборки books.json.
-    book = get_book_from_json(category, exclude_hash=exclude_hash, chat_id=chat_id)
-    if not book:
-        _tg_call(bot.send_message,
-            chat_id,
-            "😔 В этой подборке пока пусто. Загляни в другой погреб — "
-            "выбери настроение на кнопках ниже 👇",
-            reply_markup=get_mood_inline_keyboard(),
-        )
-        return
+        # 2) Fallback: случайная книга из нашей подборки books.json.
+        try:
+            book = get_book_from_json(category, exclude_hash=exclude_hash, chat_id=chat_id)
+        except AllBooksReadError:
+            # Все книги категории уже прочитаны — прерываем поиск,
+            # сообщение уже отправлено в get_book_from_json.
+            return
+        if book:
+            shelf_kb = get_shelf_action_kb(book)
 
-    shelf_kb = get_shelf_action_kb(book)
+            # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
+            # чтобы показать её в том же «карточном» формате, что и основную выдачу.
+            enrich = search_litres_by_title(book["Название"], book["Автор"])
+            if enrich and enrich.get("cover_url"):
+                book["cover_url"] = enrich["cover_url"]
+                book["book_url"] = enrich.get("book_url") or ""
+                book["rating"] = enrich.get("rating")
+                book["Ссылка"] = book["book_url"]
+                sent = _send_litres_card(chat_id, book, shelf_kb)
+            else:
+                # ЛитРес недоступен для обогащения — отправляем текстом (наша
+                # кураторская аннотация и «послевкусие» сохраняются).
+                intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
+                sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
 
-    # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
-    # чтобы показать её в том же «карточном» формате, что и основную выдачу.
-    enrich = search_litres_by_title(book["Название"], book["Автор"])
-    if enrich and enrich.get("cover_url"):
-        book["cover_url"] = enrich["cover_url"]
-        book["book_url"] = enrich.get("book_url") or ""
-        book["rating"] = enrich.get("rating")
-        book["Ссылка"] = book["book_url"]
-        sent = _send_litres_card(chat_id, book, shelf_kb)
-    else:
-        # ЛитРес недоступен для обогащения — отправляем текстом (наша
-        # кураторская аннотация и «послевкусие» сохраняются).
-        intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
-        sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
+            pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
+            user_last_book[chat_id] = book
+            return
 
-    pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
-    user_last_book[chat_id] = book
+    # Если за 3 попытки новая книга не найдена — сообщаем пользователю.
+    _tg_call(bot.send_message,
+        chat_id,
+        "Похоже, вы уже прочитали все лучшие книги в этой категории! 🏆 "
+        "Попробуйте выбрать другое настроение в меню.",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mood_"))
@@ -1272,6 +1289,46 @@ def on_clear_shelf(call):
         except telebot.apihelper.ApiTelegramException as e:
             if "message is not modified" not in str(e):
                 logger.warning("Не удалось отредактировать сообщение: %s", e)
+
+
+@bot.message_handler(content_types=['text'])
+def handle_greetings(message):
+    """Обработчик приветствий и свободного текста (находится в самом конце,
+    чтобы не перехватывать команды /start и тексты кнопок главного меню)."""
+    text = message.text.strip()
+    lower_text = text.lower()
+    try:
+        if any(word in lower_text for word in ["привет", "здравствуйте", "ку"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Привет! Я твой книжный сомелье. Выбирай категорию в меню, и я предложу что-то интересное — от легкой прозы до глубокой классики вроде Достоевского!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        elif any(word in lower_text for word in ["спасибо", "спс", "благодарю"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Всегда пожалуйста! Приятного чтения!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        elif any(word in lower_text for word in ["пока", "до свидания", "спокойной ночи"]):
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "До встречи! Жду тебя за новой порцией книг.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        else:
+            # Если пользователь ввёл что-то другое — подсказываем меню
+            _tg_call(bot.send_message,
+                message.chat.id,
+                "Я пока понимаю только нажатия на кнопки меню. Выбери настроение внизу, и я найду для тебя книгу!",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error("Ошибка в обработчике handle_greetings: %s", e)
 
 
 # --- Flask-приложение для Webhooks ---
