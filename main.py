@@ -637,6 +637,75 @@ def get_user_books(chat_id: int, status: str) -> list[dict]:
         raise ShelfDBError() from e
 
 
+def get_shelf_page(user_id: int, page_number: int = 1, items_per_page: int = 5):
+    """Возвращает текст сообщения и клавиатуру для указанной страницы полки пользователя."""
+    if page_number < 1:
+        page_number = 1
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Получаем общее количество сохраненных книг
+                cur.execute(
+                    "SELECT COUNT(*) FROM shelves WHERE chat_id = %s AND status = %s",
+                    (user_id, STATUS_SAVED),
+                )
+                total_books = cur.fetchone()["count"]
+
+                # Получаем книги для текущей страницы
+                offset = (page_number - 1) * items_per_page
+                cur.execute(
+                    "SELECT id, title, author, link FROM shelves WHERE chat_id = %s AND status = %s ORDER BY id DESC LIMIT %s OFFSET %s",
+                    (user_id, STATUS_SAVED, items_per_page, offset),
+                )
+                books = [dict(row) for row in cur.fetchall()]
+    except (psycopg2.Error, ShelfDBError) as e:
+        logger.error("Ошибка БД (get_shelf_page): %s", e)
+        traceback.print_exc()
+        raise ShelfDBError() from e
+
+    if not books:
+        return "Ваша полка пуста. Время найти что-то новое!", None
+
+    total_pages = max(1, (total_books + items_per_page - 1) // items_per_page)
+    if page_number > total_pages:
+        page_number = total_pages
+
+    lines = []
+    for i, b in enumerate(books, 1):
+        title = b.get("title", "—")
+        author = b.get("author", "—")
+        link = b.get("link")
+        if link:
+            lines.append(f"{i}. <a href=\"{link}\">{title}</a> — {author}")
+        else:
+            lines.append(f"{i}. {title} — {author}")
+
+    text = "📚 <b>Ваша полка:</b>\n\n" + "\n".join(lines)
+
+    kb = types.InlineKeyboardMarkup()
+    for b in books:
+        book_id = b["id"]
+        truncated_title = _truncate_title(b.get("title", "Книга"))
+        kb.row(
+            types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_{book_id}_{page_number}")
+        )
+
+    # Навигационные кнопки
+    nav_buttons = []
+    if page_number > 1:
+        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"shelf_page_{page_number - 1}"))
+    nav_buttons.append(types.InlineKeyboardButton(f"Стр. {page_number}/{total_pages}", callback_data="ignore"))
+    if page_number < total_pages:
+        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"shelf_page_{page_number + 1}"))
+    kb.row(*nav_buttons)
+
+    # Кнопка очистки полки
+    kb.row(types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf"))
+
+    return text, kb
+
+
 def get_user_book_titles(chat_id: int, statuses: list[str]) -> set[str]:
     """Возвращает множество названий книг пользователя с указанными статусами."""
     try:
@@ -656,13 +725,57 @@ def get_user_book_titles(chat_id: int, statuses: list[str]) -> set[str]:
 
 def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | None = None) -> None:
     """Отправляет или редактирует список книг пользователя с указанным статусом."""
+    if status == STATUS_SAVED:
+        # Для полки используем пагинацию
+        try:
+            text, kb = get_shelf_page(chat_id, page_number=1)
+        except ShelfDBError:
+            traceback.print_exc()
+            error_text = "Упс, полка временно недоступна 🛠 Попробуй чуть позже — мы уже чиним погреб."
+            if edit_message_id:
+                try:
+                    _tg_call(bot.edit_message_text,
+                        error_text,
+                        chat_id=chat_id,
+                        message_id=edit_message_id,
+                        reply_markup=None,
+                    )
+                except telebot.apihelper.ApiTelegramException as e:
+                    if "message is not modified" not in str(e):
+                        logger.warning("Не удалось отредактировать сообщение: %s", e)
+            else:
+                _tg_call(bot.send_message,
+                    chat_id,
+                    error_text,
+                    reply_markup=get_main_keyboard(),
+                )
+            return
+
+        if edit_message_id:
+            try:
+                _tg_call(bot.edit_message_text,
+                    text,
+                    chat_id=chat_id,
+                    message_id=edit_message_id,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+            except telebot.apihelper.ApiTelegramException as e:
+                if "message is not modified" not in str(e):
+                    logger.warning("Не удалось отредактировать сообщение: %s", e)
+        else:
+            _tg_call(bot.send_message,
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+
+    # Для прочитанного используем старую логику (без пагинации)
     try:
         books = get_user_books(chat_id, status)
     except ShelfDBError:
-        # Сбой БД не должен ронять бота и провоцировать петлю 429:
-        # просто сообщаем пользователю и завершаем.
-        # Выводим полный стек в консоль/Render-логи, чтобы видеть
-        # точную причину (database is locked, no such table и т.п.).
         traceback.print_exc()
         error_text = "Упс, полка временно недоступна 🛠 Попробуй чуть позже — мы уже чиним погреб."
         if edit_message_id:
@@ -684,13 +797,10 @@ def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | 
             )
         return
 
-    if status == "saved":
-        status_label = "📚 <b>Ваша полка:</b>"
-    else:
-        status_label = "✅ <b>Прочитанное:</b>"
+    status_label = "✅ <b>Прочитанное:</b>"
 
     if not books:
-        empty_text = "Ваша полка пуста. Время найти что-то новое!" if status == "saved" else "Список прочитанного пуст."
+        empty_text = "Список прочитанного пуст."
         if edit_message_id:
             try:
                 _tg_call(bot.edit_message_text,
@@ -721,21 +831,6 @@ def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | 
         else:
             lines.append(f"{i}. {title} — {author}")
 
-    # Inline-кнопки только для сохраненных книг; прочитанное — чистый список.
-    if status == "saved":
-        kb = types.InlineKeyboardMarkup()
-        for b in books:
-            book_id = b["id"]
-            truncated_title = _truncate_title(b.get("title", "Книга"))
-            kb.row(
-                types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_{book_id}")
-            )
-        kb.row(
-            types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
-        )
-    else:
-        kb = None
-
     text = f"{status_label}\n\n" + "\n".join(lines)
 
     if edit_message_id:
@@ -745,7 +840,7 @@ def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | 
                 chat_id=chat_id,
                 message_id=edit_message_id,
                 parse_mode="HTML",
-                reply_markup=kb,
+                reply_markup=None,
             )
         except telebot.apihelper.ApiTelegramException as e:
             if "message is not modified" not in str(e):
@@ -755,11 +850,9 @@ def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | 
             chat_id,
             text,
             parse_mode="HTML",
-            reply_markup=kb,
+            reply_markup=None,
         )
 
-
-# Приветственное сообщение
 welcome_text = (
     "🍷 Привет! Располагайся, ты в «Книжном сомелье».\n\n"
     "Тут без душных лекций по литературе: моя задача — достать с полок "
@@ -1263,31 +1356,80 @@ def on_shelf_add(call):
         _release_user_lock(user_id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_page_"))
+def on_shelf_page(call):
+    """Обработка навигации по страницам полки."""
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
+        return
+    try:
+        parts = call.data.split("_")
+        if len(parts) != 3:
+            safe_answer_callback_query(call, "Некорректные данные страницы.")
+            return
+        try:
+            page_number = int(parts[2])
+        except ValueError:
+            safe_answer_callback_query(call, "Некорректный номер страницы.")
+            return
+
+        try:
+            text, kb = get_shelf_page(user_id, page_number=page_number)
+        except ShelfDBError:
+            traceback.print_exc()
+            safe_answer_callback_query(call, "Упс, полка временно недоступна")
+            return
+
+        try:
+            _tg_call(bot.edit_message_text,
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" not in str(e):
+                logger.warning("Не удалось отредактировать сообщение: %s", e)
+        safe_answer_callback_query(call)
+    except Exception:
+        traceback.print_exc()
+        logger.error("Ошибка в обработчике on_shelf_page", exc_info=True)
+        try:
+            safe_answer_callback_query(call)
+        except Exception:
+            pass
+    finally:
+        _release_user_lock(user_id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("read_"))
 def on_read_book(call):
     """Обработка кнопки «Отметить прочитанным» в списке полки."""
     user_id = call.from_user.id
     if not _acquire_user_lock(user_id):
-        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
-        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
         safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
         return
     try:
+        parts = call.data.split("_")
+        if len(parts) < 2:
+            safe_answer_callback_query(call, "Некорректные данные кнопки.")
+            return
         try:
-            book_id = int(call.data.split("_")[1])
+            book_id = int(parts[1])
+            current_page = int(parts[2]) if len(parts) > 2 else 1
         except (ValueError, IndexError):
             safe_answer_callback_query(call, "Некорректные данные кнопки.")
             return
 
         try:
-            # Обновляем статус книги на read
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE shelves SET status = %s WHERE id = %s AND chat_id = %s AND status = %s",
                         (STATUS_READ, book_id, call.message.chat.id, STATUS_SAVED),
                     )
-                    # Логируем для отладки, сколько строк реально изменилось
                     print(f"PostgreSQL: Updated {cur.rowcount} rows for book_id {book_id}")
                     if cur.rowcount == 0:
                         safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
@@ -1299,58 +1441,26 @@ def on_read_book(call):
             safe_answer_callback_query(call, "Упс, полка временно недоступна")
             return
 
-        # Получаем обновленный список книг на полке
         try:
-            books = get_user_books(call.message.chat.id, status=STATUS_SAVED)
+            text, kb = get_shelf_page(call.message.chat.id, page_number=current_page)
         except ShelfDBError:
             traceback.print_exc()
             safe_answer_callback_query(call, "Упс, не удалось обновить полку")
             return
 
-        # Формируем новое сообщение и клавиатуру
-        if not books:
-            new_text = "Ваша полка пуста. Время найти что-то новое!"
-            new_kb = None
-        else:
-            lines = []
-            for i, b in enumerate(books, 1):
-                title = b.get("title", "—")
-                author = b.get("author", "—")
-                link = b.get("link")
-                if link:
-                    lines.append(f"{i}. <a href=\"{link}\">{title}</a> — {author}")
-                else:
-                    lines.append(f"{i}. {title} — {author}")
-            new_text = "📚 <b>Ваша полка:</b>\n\n" + "\n".join(lines)
-
-            new_kb = types.InlineKeyboardMarkup()
-            for b in books:
-                book_id = b["id"]
-                truncated_title = _truncate_title(b.get("title", "Книга"))
-                new_kb.row(
-                    types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_{book_id}")
-                )
-            # Добавляем кнопку очистки
-            new_kb.row(
-                types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
-            )
-
-        # Редактируем сообщение
         try:
             _tg_call(bot.edit_message_text,
-                new_text,
+                text,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode="HTML",
-                reply_markup=new_kb,
+                reply_markup=kb,
             )
         except telebot.apihelper.ApiTelegramException as e:
             if "message is not modified" not in str(e):
                 logger.warning("Не удалось отредактировать сообщение: %s", e)
         safe_answer_callback_query(call, "✅ Отмечено как прочитанное!")
     finally:
-        # Снимаем блокировку пользователя в любом исходе, иначе клики
-        # этого юзера «зависнут» в ignored-состоянии.
         _release_user_lock(user_id)
 
 
