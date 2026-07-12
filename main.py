@@ -102,6 +102,10 @@ LITRES_CDN = "https://cdn.litres.ru"        # хост обложек (без р
 # Лимит длины подписи (caption) в Telegram — 1024 символа.
 CAPTION_LIMIT = 1024
 
+# Статусы книг на полке пользователя (PostgreSQL)
+STATUS_SAVED = "saved"
+STATUS_READ = "read"
+
 # --- База данных PostgreSQL для полки пользователей ---
 # Хранение вынесено на внешний PostgreSQL (Render Postgres), чтобы данные
 # переживали рестарты сервера: эфемерная ФС Render удаляет локальный файл
@@ -168,7 +172,7 @@ def init_db() -> None:
                         title TEXT NOT NULL,
                         author TEXT,
                         link TEXT,
-                        status TEXT NOT NULL DEFAULT 'saved',
+                        status TEXT NOT NULL DEFAULT STATUS_SAVED,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -512,7 +516,7 @@ def _release_user_lock(user_id: int) -> None:
             logger.debug("Попытка снять незанятую блокировку user_id=%s", user_id)
 
 
-def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
+def add_to_shelf(chat_id: int, book: dict, status: str = STATUS_SAVED) -> bool:
     """Добавляет книгу на полку пользователя с указанным статусом.
     Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
     try:
@@ -579,7 +583,7 @@ def toggle_book_status(chat_id: int, book_id: int) -> str | None:
                 row = cur.fetchone()
                 if not row:
                     return None
-                new_status = "read" if row["status"] == "saved" else "saved"
+                new_status = STATUS_READ if row["status"] == STATUS_SAVED else STATUS_SAVED
                 cur.execute(
                     "UPDATE shelves SET status = %s WHERE id = %s",
                     (new_status, book_id),
@@ -650,7 +654,7 @@ def get_user_book_titles(chat_id: int, statuses: list[str]) -> set[str]:
         return set()
 
 
-def show_shelf(chat_id: int, status: str = "saved", edit_message_id: int | None = None) -> None:
+def show_shelf(chat_id: int, status: str = STATUS_SAVED, edit_message_id: int | None = None) -> None:
     """Отправляет или редактирует список книг пользователя с указанным статусом."""
     try:
         books = get_user_books(chat_id, status)
@@ -860,12 +864,12 @@ def handle_main_menu(message):
     try:
         # Просмотр полки отложенных книг
         if text == "📚 Моя полка":
-            show_shelf(message.chat.id, status="saved")
+            show_shelf(message.chat.id, status=STATUS_SAVED)
             return
 
         # Просмотр прочитанных книг
         if text == "✅ Прочитанное":
-            show_shelf(message.chat.id, status="read")
+            show_shelf(message.chat.id, status=STATUS_READ)
             return
 
         # Открытие меню выбора настроения
@@ -1259,7 +1263,7 @@ def on_shelf_add(call):
         _release_user_lock(user_id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("read_book_"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("read_book:"))
 def on_read_book(call):
     """Обработка кнопки «Отметить прочитанным» в списке полки."""
     user_id = call.from_user.id
@@ -1280,9 +1284,11 @@ def on_read_book(call):
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE shelves SET status = 'read' WHERE id = %s AND chat_id = %s AND status = 'saved'",
-                        (book_id, call.message.chat.id),
+                        "UPDATE shelves SET status = %s WHERE id = %s AND chat_id = %s AND status = %s",
+                        (STATUS_READ, book_id, call.message.chat.id, STATUS_SAVED),
                     )
+                    # Логируем для отладки, сколько строк реально изменилось
+                    print(f"PostgreSQL: Updated {cur.rowcount} rows for book_id {book_id}")
                     if cur.rowcount == 0:
                         safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
                         return
@@ -1295,7 +1301,7 @@ def on_read_book(call):
 
         # Получаем обновленный список книг на полке
         try:
-            books = get_user_books(call.message.chat.id, status="saved")
+            books = get_user_books(call.message.chat.id, status=STATUS_SAVED)
         except ShelfDBError:
             traceback.print_exc()
             safe_answer_callback_query(call, "Упс, не удалось обновить полку")
@@ -1359,7 +1365,7 @@ def on_clear_shelf(call):
         return
     try:
         try:
-            cleared = clear_shelf(call.message.chat.id, status="saved")
+            cleared = clear_shelf(call.message.chat.id, status=STATUS_SAVED)
         except ShelfDBError:
             traceback.print_exc()
             safe_answer_callback_query(call, "Упс, полка временно недоступна")
