@@ -6,9 +6,10 @@ import random
 import logging
 import traceback
 import time
+import sqlite3
 import hashlib
 import requests
-from functools import lru_cache
+from functools import lru_cache, wraps
 import telebot
 from telebot import types
 from dotenv import load_dotenv
@@ -1549,7 +1550,6 @@ def webhook():
             thread.start()
         return "OK", 200
     except BaseException as e: # Ловим вообще ВСЁ, включая системные выходы
-        import traceback
         print("CRITICAL WEBHOOK ERROR:")
         traceback.print_exc()
         return "OK", 200 # Сервер не имеет права отвечать 500
