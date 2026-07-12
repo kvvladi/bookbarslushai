@@ -471,6 +471,47 @@ user_current_category: dict[int, str] = {}
 user_last_book: dict[int, dict] = {}
 
 
+# --- Блокировка пользователя (User Lock) против Race Condition ---
+# Webhook-режим (см. Flask-приложение в конце файла) порождает отдельный
+# threading.Thread на каждое входящее обновление, поэтому один и тот же
+# пользователь может «долбить» inline-кнопку («Следующая книга» и т.п.)
+# десятки раз подряд, пока бот «думает» (ход в БД / ЛитРес). Без блокировки
+# эти клики честно запускают десятки параллельных потоков, бьющих в Telegram
+# API одновременно, — что и порождает шквал 429 Too Many Requests.
+# Ниже — атомарный реестр per-user блокировок: пока первый клик
+# обрабатывается, остальные клики этого же юзера игнорируются.
+_user_locks: dict[int, threading.Lock] = {}
+_user_locks_guard = threading.Lock()
+
+
+def _acquire_user_lock(user_id: int) -> bool:
+    """Атомарно пытается захватить блокировку пользователя.
+
+    Возвращает True, если блокировка захвачена (можно обрабатывать клик),
+    и False, если пользователь УЖЕ обрабатывается (спам-клик — игнорируем).
+    Использует threading.Lock.acquire(blocking=False), что исключает
+    TOCTOU-гонку, присутствующую у наивного dict.get()/dict[uid]=True.
+    """
+    with _user_locks_guard:
+        lock = _user_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _user_locks[user_id] = lock
+    return lock.acquire(blocking=False)
+
+
+def _release_user_lock(user_id: int) -> None:
+    """Снимает блокировку пользователя (всегда в блоке finally обработчика)."""
+    with _user_locks_guard:
+        lock = _user_locks.get(user_id)
+    if lock is not None:
+        try:
+            lock.release()
+        except RuntimeError:
+            # Блокировка уже свободна — не критично, просто логируем.
+            logger.debug("Попытка снять незанятую блокировку user_id=%s", user_id)
+
+
 def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
     """Добавляет книгу на полку пользователя с указанным статусом.
     Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
@@ -1081,6 +1122,12 @@ def on_mood_selected(call):
     Запоминаем выбранную категорию пользователя (state management) и
     запускаем полный цикл поиска/отправки рекомендации.
     """
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
+        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
+        return
     try:
         category = call.data[len("mood_"):]
         # Мгновенная обратная связь: показываем, что бот начал работу, и
@@ -1098,6 +1145,9 @@ def on_mood_selected(call):
         traceback.print_exc()
         logger.error("Ошибка в обработчике on_mood_selected", exc_info=True)
     finally:
+        # Снимаем блокировку пользователя (даже при ошибке) — иначе
+        # последующие клики этого юзера навсегда «зависнут» в ignored-состоянии.
+        _release_user_lock(user_id)
         # Гарантированно снимаем «часики» с кнопки в любом исходе.
         try:
             safe_answer_callback_query(call)
@@ -1116,6 +1166,12 @@ def on_next_book(call):
     из user_current_category. Весь цикл поиска (ЛитРес → fallback books.json)
     запускается заново, отправляя новую карточку отдельным сообщением.
     """
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
+        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
+        return
     try:
         chat_id = call.message.chat.id
         # Мгновенная обратная связь ДО начала поиска: показываем, что бот
@@ -1152,155 +1208,193 @@ def on_next_book(call):
             safe_answer_callback_query(call)
         except Exception:
             pass
+    finally:
+        # Снимаем блокировку пользователя в любом исходе (включая ранний
+        # return при отсутствии выбранной категории), иначе последующие
+        # клики этого юзера навсегда «зависнут» в ignored-состоянии.
+        _release_user_lock(user_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shelf_add_"))
 def on_shelf_add(call):
     """Обработка кнопок «На полку» и «Уже читал» под рекомендацией."""
-    parts = call.data.split("_", 3)
-    if len(parts) != 4:
-        safe_answer_callback_query(call, "Некорректные данные кнопки.")
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
+        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
         return
-    status = parts[2]  # saved или read
-    expected_hash = parts[3]
-
-    pending = pending_book.get(call.message.message_id)
-    if not pending:
-        safe_answer_callback_query(call, "Книга уже недоступна для добавления.")
-        return
-    if pending.get("hash") != expected_hash:
-        safe_answer_callback_query(call, "Книга уже недоступна для добавления.")
-        return
-
-    book = pending["book"]
     try:
-        added = add_to_shelf(call.message.chat.id, book, status=status)
-    except ShelfDBError:
-        # Полный стек ошибки — в консоль/Render-логи, чтобы видеть причину.
-        traceback.print_exc()
-        safe_answer_callback_query(call, "Упс, полка временно недоступна")
-        return
-    if added:
-        status_label = "📥 Добавлено на полку!" if status == "saved" else "✅ Отмечено как прочитанное!"
-        safe_answer_callback_query(call, status_label)
-    else:
-        safe_answer_callback_query(call, "Эта книга уже есть у тебя.")
+        parts = call.data.split("_", 3)
+        if len(parts) != 4:
+            safe_answer_callback_query(call, "Некорректные данные кнопки.")
+            return
+        status = parts[2]  # saved или read
+        expected_hash = parts[3]
+
+        pending = pending_book.get(call.message.message_id)
+        if not pending:
+            safe_answer_callback_query(call, "Книга уже недоступна для добавления.")
+            return
+        if pending.get("hash") != expected_hash:
+            safe_answer_callback_query(call, "Книга уже недоступна для добавления.")
+            return
+
+        book = pending["book"]
+        try:
+            added = add_to_shelf(call.message.chat.id, book, status=status)
+        except ShelfDBError:
+            # Полный стек ошибки — в консоль/Render-логи, чтобы видеть причину.
+            traceback.print_exc()
+            safe_answer_callback_query(call, "Упс, полка временно недоступна")
+            return
+        if added:
+            status_label = "📥 Добавлено на полку!" if status == "saved" else "✅ Отмечено как прочитанное!"
+            safe_answer_callback_query(call, status_label)
+        else:
+            safe_answer_callback_query(call, "Эта книга уже есть у тебя.")
+    finally:
+        # Снимаем блокировку пользователя в любом исходе (включая ранние
+        # return при невалидных данных), иначе клики юзера «зависнут».
+        _release_user_lock(user_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("read_book_"))
 def on_read_book(call):
     """Обработка кнопки «Отметить прочитанным» в списке полки."""
-    try:
-        book_id = int(call.data.split("_")[-1])
-    except (ValueError, IndexError):
-        safe_answer_callback_query(call, "Некорректные данные кнопки.")
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
+        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
         return
-
     try:
-        # Обновляем статус книги на read
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE shelves SET status = 'read' WHERE id = %s AND chat_id = %s AND status = 'saved'",
-                    (book_id, call.message.chat.id),
+        try:
+            book_id = int(call.data.split("_")[-1])
+        except (ValueError, IndexError):
+            safe_answer_callback_query(call, "Некорректные данные кнопки.")
+            return
+
+        try:
+            # Обновляем статус книги на read
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE shelves SET status = 'read' WHERE id = %s AND chat_id = %s AND status = 'saved'",
+                        (book_id, call.message.chat.id),
+                    )
+                    if cur.rowcount == 0:
+                        safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
+                        return
+                conn.commit()
+        except (psycopg2.Error, ShelfDBError) as e:
+            logger.error("Ошибка БД (on_read_book): %s", e)
+            traceback.print_exc()
+            safe_answer_callback_query(call, "Упс, полка временно недоступна")
+            return
+
+        # Получаем обновленный список книг на полке
+        try:
+            books = get_user_books(call.message.chat.id, status="saved")
+        except ShelfDBError:
+            traceback.print_exc()
+            safe_answer_callback_query(call, "Упс, не удалось обновить полку")
+            return
+
+        # Формируем новое сообщение и клавиатуру
+        if not books:
+            new_text = "Ваша полка пуста. Время найти что-то новое!"
+            new_kb = None
+        else:
+            lines = []
+            for i, b in enumerate(books, 1):
+                title = b.get("title", "—")
+                author = b.get("author", "—")
+                link = b.get("link")
+                if link:
+                    lines.append(f"{i}. <a href=\"{link}\">{title}</a> — {author}")
+                else:
+                    lines.append(f"{i}. {title} — {author}")
+            new_text = "📚 <b>Ваша полка:</b>\n\n" + "\n".join(lines)
+
+            new_kb = types.InlineKeyboardMarkup()
+            for b in books:
+                book_id = b["id"]
+                truncated_title = _truncate_title(b.get("title", "Книга"))
+                new_kb.row(
+                    types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
                 )
-                if cur.rowcount == 0:
-                    safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
-                    return
-            conn.commit()
-    except (psycopg2.Error, ShelfDBError) as e:
-        logger.error("Ошибка БД (on_read_book): %s", e)
-        traceback.print_exc()
-        safe_answer_callback_query(call, "Упс, полка временно недоступна")
-        return
-
-    # Получаем обновленный список книг на полке
-    try:
-        books = get_user_books(call.message.chat.id, status="saved")
-    except ShelfDBError:
-        traceback.print_exc()
-        safe_answer_callback_query(call, "Упс, не удалось обновить полку")
-        return
-
-    # Формируем новое сообщение и клавиатуру
-    if not books:
-        new_text = "Ваша полка пуста. Время найти что-то новое!"
-        new_kb = None
-    else:
-        lines = []
-        for i, b in enumerate(books, 1):
-            title = b.get("title", "—")
-            author = b.get("author", "—")
-            link = b.get("link")
-            if link:
-                lines.append(f"{i}. <a href=\"{link}\">{title}</a> — {author}")
-            else:
-                lines.append(f"{i}. {title} — {author}")
-        new_text = "📚 <b>Ваша полка:</b>\n\n" + "\n".join(lines)
-
-        new_kb = types.InlineKeyboardMarkup()
-        for b in books:
-            book_id = b["id"]
-            truncated_title = _truncate_title(b.get("title", "Книга"))
+            # Добавляем кнопку очистки
             new_kb.row(
-                types.InlineKeyboardButton(f"✅ Прочитал: {truncated_title}", callback_data=f"read_book:{book_id}")
+                types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
             )
-        # Добавляем кнопку очистки
-        new_kb.row(
-            types.InlineKeyboardButton("🗑 Очистить полку", callback_data="clear_shelf")
-        )
 
-    # Редактируем сообщение
-    try:
-        _tg_call(bot.edit_message_text,
-            new_text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML",
-            reply_markup=new_kb,
-        )
-    except telebot.apihelper.ApiTelegramException as e:
-        if "message is not modified" not in str(e):
-            logger.warning("Не удалось отредактировать сообщение: %s", e)
-    safe_answer_callback_query(call, "✅ Отмечено как прочитанное!")
+        # Редактируем сообщение
+        try:
+            _tg_call(bot.edit_message_text,
+                new_text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=new_kb,
+            )
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" not in str(e):
+                logger.warning("Не удалось отредактировать сообщение: %s", e)
+        safe_answer_callback_query(call, "✅ Отмечено как прочитанное!")
+    finally:
+        # Снимаем блокировку пользователя в любом исходе, иначе клики
+        # этого юзера «зависнут» в ignored-состоянии.
+        _release_user_lock(user_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "clear_shelf")
 def on_clear_shelf(call):
     """Обработка кнопки «Очистить полку»."""
-    try:
-        cleared = clear_shelf(call.message.chat.id, status="saved")
-    except ShelfDBError:
-        traceback.print_exc()
-        safe_answer_callback_query(call, "Упс, полка временно недоступна")
+    user_id = call.from_user.id
+    if not _acquire_user_lock(user_id):
+        # Пользователь уже нажал кнопку и бот ещё «думает» — игнорируем
+        # спам-клики, чтобы не порождать параллельные удары по Telegram API.
+        safe_answer_callback_query(call, "Загружаю… подождите секунду ⏳")
         return
+    try:
+        try:
+            cleared = clear_shelf(call.message.chat.id, status="saved")
+        except ShelfDBError:
+            traceback.print_exc()
+            safe_answer_callback_query(call, "Упс, полка временно недоступна")
+            return
 
-    if cleared:
-        safe_answer_callback_query(call, "🧹 Полка очищена.")
-        try:
-            _tg_call(bot.edit_message_text,
-                "Ваша полка пуста. Время найти что-то новое!",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=None,
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-            if "message is not modified" not in str(e):
-                logger.warning("Не удалось отредактировать сообщение: %s", e)
-    else:
-        safe_answer_callback_query(call, "Полка уже пуста.")
-        try:
-            _tg_call(bot.edit_message_text,
-                "Ваша полка пуста. Время найти что-то новое!",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=None,
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-            if "message is not modified" not in str(e):
-                logger.warning("Не удалось отредактировать сообщение: %s", e)
+        if cleared:
+            safe_answer_callback_query(call, "🧹 Полка очищена.")
+            try:
+                _tg_call(bot.edit_message_text,
+                    "Ваша полка пуста. Время найти что-то новое!",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            except telebot.apihelper.ApiTelegramException as e:
+                if "message is not modified" not in str(e):
+                    logger.warning("Не удалось отредактировать сообщение: %s", e)
+        else:
+            safe_answer_callback_query(call, "Полка уже пуста.")
+            try:
+                _tg_call(bot.edit_message_text,
+                    "Ваша полка пуста. Время найти что-то новое!",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            except telebot.apihelper.ApiTelegramException as e:
+                if "message is not modified" not in str(e):
+                    logger.warning("Не удалось отредактировать сообщение: %s", e)
+    finally:
+        # Снимаем блокировку пользователя в любом исходе, иначе клики
+        # этого юзера «зависнут» в ignored-состоянии.
+        _release_user_lock(user_id)
 
 
 @bot.message_handler(content_types=['text'])
