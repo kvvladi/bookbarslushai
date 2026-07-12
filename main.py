@@ -627,7 +627,7 @@ def get_user_books(chat_id: int, status: str) -> list[dict]:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, title, author, link, status FROM shelves WHERE chat_id = %s AND status = %s ORDER BY created_at DESC",
+                    "SELECT id, title, author, link, status FROM shelves WHERE chat_id = %s AND status = %s ORDER BY id DESC",
                     (chat_id, status),
                 )
                 return [dict(row) for row in cur.fetchall()]
