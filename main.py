@@ -4,7 +4,6 @@ import os
 import json
 import random
 import logging
-import sqlite3
 import traceback
 import time
 import hashlib
@@ -15,6 +14,8 @@ from telebot import types
 from dotenv import load_dotenv
 from flask import Flask, request
 import threading
+import psycopg2
+import psycopg2.extras
 
 load_dotenv()
 
@@ -101,44 +102,74 @@ LITRES_CDN = "https://cdn.litres.ru"        # хост обложек (без р
 # Лимит длины подписи (caption) в Telegram — 1024 символа.
 CAPTION_LIMIT = 1024
 
-# --- База данных SQLite для полки пользователей ---
-DB_PATH = "books.db"
+# --- База данных PostgreSQL для полки пользователей ---
+# Хранение вынесено на внешний PostgreSQL (Render Postgres), чтобы данные
+# переживали рестарты сервера: эфемерная ФС Render удаляет локальный файл
+# sqlite при каждом деплое/перезапуске, из-за чего сбрасывались «Моя полка»
+# и «Прочитанное».
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    logger.warning("CRITICAL: DATABASE_URL is not set!")
 
 class ShelfDBError(Exception):
-    """Ошибка доступа к БД полки пользователя (SQLite).
+    """Ошибка доступа к БД полки пользователя (PostgreSQL).
 
-    Оборачивает sqlite3.Error, чтобы вызывающий код (обработчики бота)
+    Оборачивает psycopg2.Error, чтобы вызывающий код (обработчики бота)
     мог одним блоком перехватить сбой БД и уведомить пользователя,
-    не роняя бота и не провоцируя петлю 429 от Telegram.
+    не роняя бота и не провоцируя петлю 429 от Telegram. Также
+    поднимается, когда DATABASE_URL не задан (безопасный фоллбэк).
     """
     pass
+
+
+def get_db_connection():
+    """Возвращает новое подключение к PostgreSQL по DATABASE_URL.
+
+    Каждый вызов открывает независимое соединение — это держит работу
+    потокобезопасной: каждый поток бота работает со своим коннектом, и
+    параллельные запросы не мешают друг другу (общий коннект в psycopg2
+    не является thread-safe). Если DATABASE_URL не задан — поднимает
+    ShelfDBError, чтобы вызывающий код корректно обработал отсутствие БД.
+    """
+    if not DATABASE_URL:
+        raise ShelfDBError()
+    return psycopg2.connect(DATABASE_URL)
+
 
 def init_db() -> None:
     """Создаёт таблицу полки пользователей, если она не существует.
 
     Вызывается один раз при старте приложения (до обработки запросов).
     Подключение открывается локально и закрывается контекстным
-    менеджером. timeout=10 защищает от 'database is locked' при
-    конкурентных потоках, а WAL-журнал позволяет читателям и писателю
-    работать параллельно, снижая блокировки под нагрузкой.
+    менеджером. В PostgreSQL блокировки строк решаются на уровне СУБД,
+    поэтому отдельный WAL/timeout не нужны — конкурентные потоки
+    безопасно работают через независимые соединения. Если DATABASE_URL
+    не задан — просто выходим, не роняя бота при старте.
     """
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS shelves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                author TEXT,
-                link TEXT,
-                status TEXT NOT NULL DEFAULT 'saved',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_shelves_chat_status
-            ON shelves (chat_id, status)
-        """)
+    if not DATABASE_URL:
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS shelves (
+                        id BIGSERIAL PRIMARY KEY,
+                        chat_id BIGINT NOT NULL,
+                        title TEXT NOT NULL,
+                        author TEXT,
+                        link TEXT,
+                        status TEXT NOT NULL DEFAULT 'saved',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_shelves_chat_status
+                    ON shelves (chat_id, status)
+                """)
+            conn.commit()
+    except psycopg2.Error as e:
+        logger.error("Ошибка при инициализации БД: %s", e)
+        traceback.print_exc()
 
 
 # --- Маппинг эмоциональных категорий на поисковые запросы ЛитРес ---
@@ -412,29 +443,32 @@ def add_to_shelf(chat_id: int, book: dict, status: str = "saved") -> bool:
     Возвращает False, если такая книга уже есть у пользователя (дедуп по названию)."""
     try:
         # Локальное подключение внутри функции: каждый поток открывает и
-        # закрывает своё соединение. timeout=10 — поток ждёт в очереди,
-        # если база занята другим писателем, вместо мгновенного
-        # 'database is locked'. commit() выполняется автоматически при
-        # выходе из `with` (без исключений).
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            cur = conn.execute(
-                "SELECT id FROM shelves WHERE chat_id = ? AND title = ?",
-                (str(chat_id), book.get("Название", "")),
-            )
-            if cur.fetchone():
-                return False
-            conn.execute(
-                "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(chat_id),
-                    book.get("Название", ""),
-                    book.get("Автор", ""),
-                    book.get("Ссылка", ""),
-                    status,
-                ),
-            )
+        # закрывает своё соединение (psycopg2-коннект не thread-safe,
+        # поэтому общий пул здесь не используем). commit() выполняется
+        # явно после успешной записи, коннект закрывается контекстным
+        # менеджером. При отсутствии DATABASE_URL get_db_connection
+        # поднимает ShelfDBError — бот не падает, а сообщает об ошибке.
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM shelves WHERE chat_id = %s AND title = %s",
+                    (chat_id, book.get("Название", "")),
+                )
+                if cur.fetchone():
+                    return False
+                cur.execute(
+                    "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        chat_id,
+                        book.get("Название", ""),
+                        book.get("Автор", ""),
+                        book.get("Ссылка", ""),
+                        status,
+                    ),
+                )
+            conn.commit()
             return True
-    except sqlite3.Error as e:
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (add_to_shelf): %s", e)
         traceback.print_exc()
         raise ShelfDBError() from e
@@ -444,13 +478,16 @@ def remove_from_shelf(chat_id: int, book_id: int) -> bool:
     """Убирает книгу с полки пользователя по ID записи.
     Возвращает True, если книга была найдена и удалена."""
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            cur = conn.execute(
-                "DELETE FROM shelves WHERE id = ? AND chat_id = ?",
-                (book_id, str(chat_id)),
-            )
-            return cur.rowcount > 0
-    except sqlite3.Error as e:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM shelves WHERE id = %s AND chat_id = %s",
+                    (book_id, chat_id),
+                )
+                deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (remove_from_shelf): %s", e)
         traceback.print_exc()
         raise ShelfDBError() from e
@@ -459,22 +496,23 @@ def remove_from_shelf(chat_id: int, book_id: int) -> bool:
 def toggle_book_status(chat_id: int, book_id: int) -> str | None:
     """Меняет статус книги: saved <-> read. Возвращает новый статус или None."""
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT status FROM shelves WHERE id = ? AND chat_id = ?",
-                (book_id, str(chat_id)),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            new_status = "read" if row["status"] == "saved" else "saved"
-            conn.execute(
-                "UPDATE shelves SET status = ? WHERE id = ?",
-                (new_status, book_id),
-            )
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT status FROM shelves WHERE id = %s AND chat_id = %s",
+                    (book_id, chat_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                new_status = "read" if row["status"] == "saved" else "saved"
+                cur.execute(
+                    "UPDATE shelves SET status = %s WHERE id = %s",
+                    (new_status, book_id),
+                )
+            conn.commit()
             return new_status
-    except sqlite3.Error as e:
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (toggle_book_status): %s", e)
         traceback.print_exc()
         raise ShelfDBError() from e
@@ -484,19 +522,22 @@ def clear_shelf(chat_id: int, status: str | None = None) -> bool:
     """Очищает полку пользователя (все статусы или только указанный).
     Возвращает True, если что-то было удалено."""
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            if status:
-                cur = conn.execute(
-                    "DELETE FROM shelves WHERE chat_id = ? AND status = ?",
-                    (str(chat_id), status),
-                )
-            else:
-                cur = conn.execute(
-                    "DELETE FROM shelves WHERE chat_id = ?",
-                    (str(chat_id),),
-                )
-            return cur.rowcount > 0
-    except sqlite3.Error as e:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if status:
+                    cur.execute(
+                        "DELETE FROM shelves WHERE chat_id = %s AND status = %s",
+                        (chat_id, status),
+                    )
+                else:
+                    cur.execute(
+                        "DELETE FROM shelves WHERE chat_id = %s",
+                        (chat_id,),
+                    )
+                deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (clear_shelf): %s", e)
         traceback.print_exc()
         raise ShelfDBError() from e
@@ -505,14 +546,14 @@ def clear_shelf(chat_id: int, status: str | None = None) -> bool:
 def get_user_books(chat_id: int, status: str) -> list[dict]:
     """Возвращает список книг пользователя с указанным статусом."""
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT id, title, author, link, status FROM shelves WHERE chat_id = ? AND status = ? ORDER BY created_at DESC",
-                (str(chat_id), status),
-            )
-            return [dict(row) for row in cur.fetchall()]
-    except sqlite3.Error as e:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, title, author, link, status FROM shelves WHERE chat_id = %s AND status = %s ORDER BY created_at DESC",
+                    (chat_id, status),
+                )
+                return [dict(row) for row in cur.fetchall()]
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (get_user_books): %s", e)
         traceback.print_exc()
         raise ShelfDBError() from e
@@ -1059,15 +1100,17 @@ def on_read_book(call):
 
     try:
         # Обновляем статус книги на read
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            cur = conn.execute(
-                "UPDATE shelves SET status = 'read' WHERE id = ? AND chat_id = ? AND status = 'saved'",
-                (book_id, str(call.message.chat.id)),
-            )
-            if cur.rowcount == 0:
-                safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
-                return
-    except sqlite3.Error as e:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE shelves SET status = 'read' WHERE id = %s AND chat_id = %s AND status = 'saved'",
+                    (book_id, call.message.chat.id),
+                )
+                if cur.rowcount == 0:
+                    safe_answer_callback_query(call, "Книга не найдена или уже прочитана.")
+                    return
+            conn.commit()
+    except (psycopg2.Error, ShelfDBError) as e:
         logger.error("Ошибка БД (on_read_book): %s", e)
         traceback.print_exc()
         safe_answer_callback_query(call, "Упс, полка временно недоступна")
