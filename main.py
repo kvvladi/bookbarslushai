@@ -193,7 +193,7 @@ def init_db() -> None:
 MOOD_TO_LITRES = {
     "Уютный вечер": "современная проза уютное бестселлеры",
     "Хочу острых ощущений": "остросюжетный триллер боевик бестселлеры",
-    "Немного поплакать": "лирическая проза драма бестселлеры",
+    "Немного поплакать": "драма современная проза трагедия сентиментальная проза маленькая жизнь щегол",
     # Классика и мировая литература приоритизированы: добавлены ключевые
     # слова, чтобы зарубежная/русская классика и мировые бестселлеры
     # попадали в топ результатов (сортировка sort=popular/relevance).
@@ -204,7 +204,7 @@ MOOD_TO_LITRES = {
     "Проглотить за одну ночь": "остросюжетный детектив триллер бестселлеры",
     "Моральный детокс": "современная проза вдохновляющие бестселлеры",
     # Новые категории меню: детективы/триллеры, любовные романы, фэнтези.
-    "Холодный расчёт": "остросюжетный детектив триллер звездная коллекция издательских детективов и мистики",
+    "Холодный расчёт": "интеллектуальный детектив триллер расследование загадка шерлок холмс агата кристи",
     "Пьянящая романтика": "современный любовный роман зарубежная сентиментальная проза бестселлеры хиты",
     "Шагнуть в портал": "эпическое фэнтези магия миры хиты продаж",
 }
@@ -1153,11 +1153,14 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
 def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = None) -> None:
     """Полный цикл поиска и отправки карточки книги по категории.
 
-    Сначала пытаемся найти книгу по категории напрямую через ЛитРес
-    (с учётом фильтров рейтинга и популярности). Если API недоступно
-    или ничего не найдено — берём книгу из нашей подборки books.json
-    (fallback). Используется и при первичном выборе настроения, и при
-    нажатии кнопки «Следующая книга».
+    Сначала запрашиваем книги у ЛитРес. Если API вернул пустой список
+    или произошла ошибка — загружаем книги из локальной подборки
+    books.json (fallback). Объединённый список фильтруется по базе
+    прочитанного пользователя, и только если после фильтрации список
+    пуст — сообщаем, что все книги прочитаны.
+
+    Используется и при первичном выборе настроения, и при нажатии
+    кнопки «Следующая книга».
 
     exclude_hash — хэш текущей книги; передаётся из callback_data кнопки
     «Следующая книга», чтобы не выдать ту же книгу повторно.
@@ -1169,12 +1172,44 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
     """
     # Лимит попыток поиска: максимум 3 попытки найти непрочитанную книгу.
     for _ in range(3):
-        # 1) Пробуем ЛитРес по категории (обложка + аннотация + рейтинг + ссылка).
-        try:
-            litres_book = get_litres_random_book(category, exclude_hash=exclude_hash, chat_id=chat_id)
-        except AllBooksReadError:
-            # Все книги категории уже прочитаны — прерываем поиск
-            # и отправляем сообщение через _tg_call (защита от 429).
+        # 1) Запрашиваем сырой список у ЛитРес (без фильтра прочитанного).
+        api_books = list(get_litres_books_list(category))
+
+        # 2) Если API вернул пустой список — загружаем fallback из books.json.
+        json_books = []
+        if not api_books:
+            books_db = _load_curated()
+            json_raw = books_db.get(category, [])
+            json_books = [
+                {
+                    "Название": b.get("title", "—"),
+                    "Автор": b.get("author", "—"),
+                    "Описание": b.get("annotation", ""),
+                    "Послевкусие": b.get("aftertaste", ""),
+                    "Ссылка": "",
+                }
+                for b in json_raw
+            ]
+
+        # 3) Объединяем результаты API и fallback.
+        combined = api_books + json_books
+        if not combined:
+            continue
+
+        # 4) Исключаем текущую книгу (защита от дублей в «Следующая книга»).
+        if exclude_hash:
+            combined = [b for b in combined if _book_hash(b) != exclude_hash]
+            if not combined:
+                continue
+
+        # 5) Применяем фильтр по базе прочитанного пользователя.
+        if chat_id is not None:
+            user_titles = get_user_book_titles(chat_id, ["saved", "read"])
+            if user_titles:
+                combined = [b for b in combined if b.get("Название") not in user_titles]
+
+        # 6) Если после фильтрации список пуст — все книги уже прочитаны.
+        if not combined:
             _tg_call(bot.send_message,
                 chat_id,
                 "Похоже, вы уже прочитали все лучшие книги в этой категории! 🏆 "
@@ -1182,29 +1217,16 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
                 reply_markup=get_main_keyboard(),
             )
             return
-        if litres_book:
-            shelf_kb = get_shelf_action_kb(litres_book)
-            sent = _send_litres_card(chat_id, litres_book, shelf_kb)
-            pending_book[sent.message_id] = {"book": litres_book, "hash": _book_hash(litres_book)}
-            user_last_book[chat_id] = litres_book
-            return
 
-        # 2) Fallback: случайная книга из нашей подборки books.json.
-        try:
-            book = get_book_from_json(category, exclude_hash=exclude_hash, chat_id=chat_id)
-        except AllBooksReadError:
-            # Все книги категории уже прочитаны — прерываем поиск
-            # и отправляем сообщение через _tg_call (защита от 429).
-            _tg_call(bot.send_message,
-                chat_id,
-                "Похоже, вы уже прочитали все лучшие книги в этой категории! 🏆 "
-                "Попробуйте выбрать другое настроение в меню.",
-                reply_markup=get_main_keyboard(),
-            )
-            return
-        if book:
-            shelf_kb = get_shelf_action_kb(book)
+        # 7) Выбираем случайную книгу из объединённого списка.
+        book = random.choice(combined)
+        is_from_api = bool(book.get("cover_url"))  # API-книги всегда имеют обложку.
 
+        shelf_kb = get_shelf_action_kb(book)
+
+        if is_from_api:
+            sent = _send_litres_card(chat_id, book, shelf_kb)
+        else:
             # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
             # чтобы показать её в том же «карточном» формате, что и основную выдачу.
             enrich = search_litres_by_title(book["Название"], book["Автор"])
@@ -1220,9 +1242,9 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
                 intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
                 sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
 
-            pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
-            user_last_book[chat_id] = book
-            return
+        pending_book[sent.message_id] = {"book": book, "hash": _book_hash(book)}
+        user_last_book[chat_id] = book
+        return
 
     # Если за 3 попытки новая книга не найдена — сообщаем пользователю.
     _tg_call(bot.send_message,
