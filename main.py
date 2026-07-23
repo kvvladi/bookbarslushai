@@ -174,12 +174,18 @@ def init_db() -> None:
                         author TEXT,
                         link TEXT,
                         status TEXT NOT NULL DEFAULT STATUS_SAVED,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        pages INTEGER
                     )
                 """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_shelves_chat_status
                     ON shelves (chat_id, status)
+                """)
+                # Добавляем колонку pages, если её нет (для существующих таблиц)
+                cur.execute("""
+                    ALTER TABLE shelves 
+                    ADD COLUMN IF NOT EXISTS pages INTEGER
                 """)
             conn.commit()
     except psycopg2.Error as e:
@@ -314,6 +320,9 @@ def get_litres_books_list(category: str) -> tuple:
         if book_url.startswith("/"):
             book_url = LITRES_BASE + book_url
 
+        # Извлекаем количество страниц (безопасно, если поля нет — None)
+        pages = inst.get("pages") or inst.get("pages_count") or None
+
         candidates.append({
             "Название": inst.get("title", "—"),
             "Автор": author,
@@ -323,6 +332,7 @@ def get_litres_books_list(category: str) -> tuple:
             "cover_url": inst.get("cover_url"),
             "rating": rating,
             "book_url": book_url,
+            "pages": pages,
         })
     # Возвращаем КОРТЕЖ (иммутабельно — безопасно для lru_cache),
     # чтобы random.choice происходил уже вне кэшированной функции.
@@ -400,9 +410,13 @@ def _build_litres_caption(book: dict) -> str:
     except (TypeError, ValueError):
         rating_val = None
     if rating_val is not None and rating_val > 0:
-        rating_line = f"Рейтинг: ⭐ {rating_val}"
+        rating_line = f"Рейтинг ЛитРес: ⭐ {rating_val}"
     else:
-        rating_line = "Рейтинг: пока нет оценок"
+        rating_line = "Рейтинг ЛитРес: пока нет оценок"
+
+    # Количество страниц (показываем только если есть данные).
+    pages = book.get("pages")
+    pages_line = f"📖 Объем: {pages} стр." if pages else ""
 
     # Аннотация (показываем только если не пустая).
     annotation = (book.get("Описание") or "").strip()
@@ -556,13 +570,14 @@ def add_to_shelf(chat_id: int, book: dict, status: str = STATUS_SAVED) -> bool:
                 if cur.fetchone():
                     return False
                 cur.execute(
-                    "INSERT INTO shelves (chat_id, title, author, link, status) VALUES (%s, %s, %s, %s, %s)",
+                    "INSERT INTO shelves (chat_id, title, author, link, status, pages) VALUES (%s, %s, %s, %s, %s, %s)",
                     (
                         chat_id,
                         book.get("Название", ""),
                         book.get("Автор", ""),
                         book.get("Ссылка", ""),
                         status,
+                        book.get("pages"),
                     ),
                 )
             conn.commit()
