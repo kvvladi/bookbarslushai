@@ -8,6 +8,7 @@ import traceback
 import time
 import sqlite3
 import hashlib
+import re
 import requests
 from functools import lru_cache, wraps
 import telebot
@@ -74,6 +75,25 @@ def _tg_call(func, *args, **kwargs):
     # Исчерпали лимит повторов — пробрасываем последнюю ошибку 429 наверх.
     if last_exc is not None:
         raise last_exc
+
+
+def get_pages_from_html(url: str) -> int | None:
+    """Скрейпит количество страниц со страницы книги на ЛитРес.
+
+    Использует регулярные выражения для поиска текста вида
+    "Объем 390 страниц" или "Объем: 390 стр" в HTML-коде.
+    Учитывает возможные пробелы внутри чисел (например, "71 0").
+    """
+    try:
+        response = requests.get(url, timeout=3)
+        response.raise_for_status()
+        match = re.search(r'Объем.*?(\d+(?:\s*\d+)?)\s*стр', response.text, re.IGNORECASE)
+        if match:
+            pages_str = match.group(1).replace(" ", "")
+            return int(pages_str)
+    except Exception as e:
+        print(f"Ошибка парсинга страниц с {url}: {e}")
+    return None
 
 
 def safe_answer_callback_query(call, text: str = "") -> None:
@@ -1224,6 +1244,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
                     "Описание": b.get("annotation", ""),
                     "Послевкусие": b.get("aftertaste", ""),
                     "Ссылка": "",
+                    "pages": b.get("pages"),
                 }
                 for b in json_raw
             ]
@@ -1262,6 +1283,11 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
         shelf_kb = get_shelf_action_kb(book)
 
         if is_from_api:
+            # Скрейпим страницы для API-книг перед отправкой (URL уже известен).
+            if not book.get("pages") and book.get("book_url"):
+                scraped_pages = get_pages_from_html(book["book_url"])
+                if scraped_pages:
+                    book["pages"] = scraped_pages
             sent = _send_litres_card(chat_id, book, shelf_kb)
         else:
             # Пробуем обогатить книгу из books.json обложкой и ссылкой с ЛитРес,
@@ -1271,12 +1297,24 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
                 book["cover_url"] = enrich["cover_url"]
                 book["book_url"] = enrich.get("book_url") or ""
                 book["rating"] = enrich.get("rating")
-                book["pages"] = enrich.get("pages")
+                # Перезаписываем pages только если обогащение вернуло валидное значение.
+                if enrich.get("pages"):
+                    book["pages"] = enrich["pages"]
                 book["Ссылка"] = book["book_url"]
+                # Скрейпим после обогащения, если pages всё ещё отсутствует.
+                if not book.get("pages") and book.get("book_url"):
+                    scraped_pages = get_pages_from_html(book["book_url"])
+                    if scraped_pages:
+                        book["pages"] = scraped_pages
                 sent = _send_litres_card(chat_id, book, shelf_kb)
             else:
                 # ЛитРес недоступен для обогащения — отправляем текстом (наша
                 # кураторская аннотация и «послевкусие» сохраняются).
+                # Скрейпим страницы для текстового режима, если есть URL.
+                if not book.get("pages") and book.get("book_url"):
+                    scraped_pages = get_pages_from_html(book["book_url"])
+                    if scraped_pages:
+                        book["pages"] = scraped_pages
                 intro_text = book.get("Послевкусие") or random.choice(SOMMELIER_INTROS).replace("🍷 ", "", 1)
                 sent = _send_book_text(chat_id, book, intro_text, shelf_kb)
 
