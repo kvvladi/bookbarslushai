@@ -960,7 +960,7 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
 
 # --- Обработчики бота ---
 
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=["start", "menu"])
 def send_welcome(message):
     try:
         _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=get_main_keyboard())
@@ -1520,6 +1520,8 @@ def handle_greetings(message):
     чтобы не перехватывать команды /start и тексты кнопок главного меню)."""
     text = message.text.strip()
     lower_text = text.lower()
+    if message.text.startswith("/"):
+        return
     try:
         if any(word in lower_text for word in ["привет", "здравствуйте", "ку"]):
             _tg_call(bot.send_message,
