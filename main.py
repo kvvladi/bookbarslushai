@@ -394,33 +394,36 @@ def _build_litres_caption(book: dict) -> str:
     """Собирает HTML-подпись к карточке ЛитРес и обрезает до лимита (1024).
 
     Формат карточки:
-        Название книги
-        Автор: Имя Автора
-        Рейтинг: ⭐ 4.5
-        Аннотация...
+        📚 Название книги
+        ✍️ Автор: Имя Автора
+        ⭐ Рейтинг ЛитРес: 4.5
+        📖 Объем: 320 стр.
+        📝 Аннотация...
+        🥂 Послевкусие...
+        🔗 Ссылка
     """
     title = book.get("Название", "—")
     author = book.get("Автор", "—")
     rating = book.get("rating")
     book_url = book.get("book_url") or book.get("Ссылка") or ""
 
-    # Рейтинг в формате «⭐ 4.5» (одна звезда-маркер + числовое значение).
+    # Рейтинг в формате «⭐ Рейтинг ЛитРес: 4.5».
     try:
         rating_val = float(rating) if rating is not None else None
     except (TypeError, ValueError):
         rating_val = None
     if rating_val is not None and rating_val > 0:
-        rating_line = f"Рейтинг ЛитРес: ⭐ {rating_val}"
+        rating_line = f"⭐ Рейтинг ЛитРес: {rating_val}"
     else:
-        rating_line = "Рейтинг ЛитРес: пока нет оценок"
+        rating_line = "⭐ Рейтинг ЛитРес: Нет оценок"
 
     # Количество страниц (показываем только если есть данные).
     pages = book.get("pages")
-    pages_line = f"📖 Объем: {pages} стр." if pages else ""
+    pages_line = f"\n📖 Объем: {pages} стр." if pages else ""
 
     # Аннотация (показываем только если не пустая).
     annotation = (book.get("Описание") or "").strip()
-    ann_block = f"\n\n{annotation}" if annotation else ""
+    ann_block = f"\n\n📝 {annotation}" if annotation else ""
 
     # Подводка сомелье: используем кураторское «послевкусие» (если есть,
     # например, из books.json), иначе — случайную подводку.
@@ -431,9 +434,9 @@ def _build_litres_caption(book: dict) -> str:
     link_line = f"\n\n🔗 <a href=\"{book_url}\">Читать на ЛитРес</a>" if book_url else ""
 
     header = (
-        f"📖 <b>{title}</b>\n"
-        f"Автор: {author}\n"
-        f"{rating_line}"
+        f"📚 <b>{title}</b>\n"
+        f"✍️ Автор: {author}\n"
+        f"{rating_line}{pages_line}"
     )
     footer = (
         f"{ann_block}"
@@ -444,7 +447,7 @@ def _build_litres_caption(book: dict) -> str:
     caption = header + footer
     if len(caption) > CAPTION_LIMIT:
         # Обрезаем аннотацию/подводку, оставляя базовые поля (название,
-        # автор, рейтинг) и ссылку, с запасом под многоточие.
+        # автор, рейтинг, страницы) и ссылку, с запасом под многоточие.
         allowed = CAPTION_LIMIT - len(header) - len(link_line) - 1
         if allowed > 0:
             body = (ann_block + f"\n\n🥂 <b>Послевкусие</b>\n\n{intro}").strip()
@@ -975,12 +978,24 @@ def get_shelf_action_kb(book: dict) -> types.InlineKeyboardMarkup:
 
 # --- Обработчики бота ---
 
-@bot.message_handler(commands=["start", "menu"])
-def send_welcome(message):
+@bot.message_handler(commands=["start"])
+def send_start(message):
     try:
-        _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=get_main_keyboard())
+        _tg_call(bot.send_message, message.chat.id, welcome_text, reply_markup=None)
     except telebot.apihelper.ApiTelegramException as e:
         logger.error("Не удалось отправить приветствие: %s", e)
+
+
+@bot.message_handler(commands=["menu"])
+def send_menu(message):
+    try:
+        _tg_call(bot.send_message,
+            message.chat.id,
+            "Выбери настроение:",
+            reply_markup=get_mood_inline_keyboard(),
+        )
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error("Не удалось отправить меню: %s", e)
 
 
 @bot.message_handler(func=lambda message: message.text in [
@@ -1083,14 +1098,15 @@ def get_book_from_json(category: str, exclude_hash: str | None = None, chat_id: 
         "Описание": b.get("annotation", ""),
         "Послевкусие": b.get("aftertaste", ""),
         "Ссылка": "",
+        "pages": b.get("pages"),
     }
 
 
 def search_litres_by_title(title: str, author: str) -> dict | None:
     """Ищет конкретную книгу на ЛитРес по названию+автору, чтобы обогатить
-    книгу из books.json обложкой и прямой ссылкой.
+    книгу из books.json обложкой, прямой ссылкой, рейтингом и страницами.
 
-    Возвращает {cover_url, book_url, rating} или None при ошибке/отсутствии.
+    Возвращает {cover_url, book_url, rating, pages} или None при ошибке/отсутствии.
     """
     if not title:
         return None
@@ -1117,6 +1133,7 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
     cover = None
     url = None
     rating = None
+    pages = None
     for item in items[:5]:
         inst = item.get("instance") or {}
         if inst.get("cover_url"):
@@ -1127,6 +1144,7 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
                 rating = float(rating) if rating is not None else None
             except (TypeError, ValueError):
                 rating = None
+            pages = inst.get("pages") or inst.get("pages_count") or None
             break
     if not cover:
         return None
@@ -1135,7 +1153,7 @@ def search_litres_by_title(title: str, author: str) -> dict | None:
     if url and url.startswith("/"):
         url = LITRES_BASE + url
 
-    return {"cover_url": cover, "book_url": url, "rating": rating}
+    return {"cover_url": cover, "book_url": url, "rating": rating, "pages": pages}
 
 
 def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "types.Message":
@@ -1149,15 +1167,19 @@ def _send_book_text(chat_id: int, book: dict, intro_text: str, shelf_kb) -> "typ
     except (TypeError, ValueError):
         rating_val = None
     if rating_val is not None and rating_val > 0:
-        rating_line = f"Рейтинг: ⭐ {rating_val}"
+        rating_line = f"⭐ Рейтинг ЛитРес: {rating_val}"
     else:
-        rating_line = "Рейтинг: пока нет оценок"
+        rating_line = "⭐ Рейтинг ЛитРес: Нет оценок"
+    
+    pages = book.get("pages")
+    pages_line = f"\n📖 Объем: {pages} стр." if pages else ""
+    
     annotation = (book.get("Описание") or "").strip()
-    ann_block = f"\n\n{annotation}" if annotation else ""
+    ann_block = f"\n\n📝 {annotation}" if annotation else ""
     response = (
-        f"📖 <b>{book['Название']}</b>\n"
-        f"Автор: {book['Автор']}\n"
-        f"{rating_line}"
+        f"📚 <b>{book['Название']}</b>\n"
+        f"✍️ Автор: {book['Автор']}\n"
+        f"{rating_line}{pages_line}"
         f"{ann_block}"
         f"\n\n🥂 <b>Послевкусие</b>\n\n{intro_text}"
         f"{link_line}"
@@ -1249,6 +1271,7 @@ def send_recommendation(chat_id: int, category: str, exclude_hash: str | None = 
                 book["cover_url"] = enrich["cover_url"]
                 book["book_url"] = enrich.get("book_url") or ""
                 book["rating"] = enrich.get("rating")
+                book["pages"] = enrich.get("pages")
                 book["Ссылка"] = book["book_url"]
                 sent = _send_litres_card(chat_id, book, shelf_kb)
             else:
